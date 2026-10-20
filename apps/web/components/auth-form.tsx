@@ -13,6 +13,7 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (busy) return;
     setError("");
     setBusy(true);
     const values = new FormData(event.currentTarget);
@@ -22,6 +23,15 @@ export function AuthForm({ mode }: { mode: "login" | "register" }) {
         method: "POST",
         body: JSON.stringify(payload)
       });
+      if (!response.ok && response.status === 429) {
+        const retryAfterSeconds = Number(response.headers.get("retry-after"));
+        const retryMessage = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? retryAfterSeconds < 60
+            ? `Please try again in ${retryAfterSeconds} seconds.`
+            : `Please try again in about ${Math.ceil(retryAfterSeconds / 60)} minutes.`
+          : "Please wait for the 15-minute limit window to reset before trying again.";
+        throw new Error(`Too many authentication attempts. ${retryMessage}`);
+      }
       if (!response.ok) throw new Error(apiErrorMessage(data, "Could not authenticate. Please try again."));
       router.push("/dashboard");
     } catch (caught) {

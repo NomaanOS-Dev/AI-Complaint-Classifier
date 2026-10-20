@@ -4,6 +4,7 @@ import path from "node:path";
 import { existsSync } from "node:fs";
 import { after, before, describe, test } from "node:test";
 import { randomBytes } from "node:crypto";
+import type { Server } from "node:http";
 import dotenv from "dotenv";
 import pg from "pg";
 
@@ -23,15 +24,18 @@ const { Pool } = pg;
 const schema = `nomaanos_test_${process.pid}`;
 const adminPool = new Pool({ connectionString: process.env.DATABASE_URL });
 let testPool: InstanceType<typeof Pool>;
-let server: ReturnType<import("express").Express["listen"]>;
+let server: Server;
+let rateLimitServer: Server | undefined;
 let baseUrl: string;
 let createdSchema = false;
 
-type ApiResult = { status: number; body: Record<string, any> };
+type ApiResult = { status: number; body: Record<string, any>; headers: Headers };
 
 class ApiClient {
   cookie = "";
   csrfToken = "";
+
+  constructor(private readonly origin = baseUrl) {}
 
   private remember(response: Response) {
     const setCookie = response.headers.getSetCookie?.()[0] ?? response.headers.get("set-cookie");
@@ -40,15 +44,18 @@ class ApiClient {
 
   async request(pathname: string, method = "GET", body?: unknown, csrf = ["POST", "PATCH", "DELETE"].includes(method)) {
     if (csrf && !this.csrfToken) {
-      const tokenResponse = await fetch(`${baseUrl}/auth/csrf`, { headers: this.cookie ? { cookie: this.cookie } : {} });
+      const tokenHeaders: Record<string, string> = { origin: "http://localhost:3000" };
+      if (this.cookie) tokenHeaders.cookie = this.cookie;
+      const tokenResponse = await fetch(`${this.origin}/auth/csrf`, { headers: tokenHeaders });
       this.remember(tokenResponse);
       this.csrfToken = (await tokenResponse.json() as { csrfToken: string }).csrfToken;
     }
     const headers: Record<string, string> = {};
+    headers.origin = "http://localhost:3000";
     if (body !== undefined) headers["content-type"] = "application/json";
     if (this.cookie) headers.cookie = this.cookie;
     if (csrf) headers["x-csrf-token"] = this.csrfToken;
-    const response = await fetch(`${baseUrl}${pathname}`, {
+    const response = await fetch(`${this.origin}${pathname}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body)
@@ -56,7 +63,7 @@ class ApiClient {
     this.remember(response);
     const responseBody = response.status === 204 ? {} : await response.json() as Record<string, any>;
     if (typeof responseBody.csrfToken === "string") this.csrfToken = responseBody.csrfToken;
-    return { status: response.status, body: responseBody } satisfies ApiResult;
+    return { status: response.status, body: responseBody, headers: response.headers } satisfies ApiResult;
   }
 }
 
@@ -91,6 +98,7 @@ describe("Day 2 authentication and tenant isolation", () => {
   });
 
   after(async () => {
+    if (rateLimitServer) await new Promise<void>((resolve, reject) => rateLimitServer!.close((error) => error ? reject(error) : resolve()));
     if (server) await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     if (testPool) await testPool.end();
     if (createdSchema) await adminPool.query(`DROP SCHEMA "${schema}" CASCADE`);
@@ -192,5 +200,25 @@ describe("Day 2 authentication and tenant isolation", () => {
     assert.deepEqual(health.body, { status: "ok", service: "api", database: "ok" });
     const migrations = await testPool.query("SELECT name FROM schema_migrations ORDER BY name");
     assert.deepEqual(migrations.rows.map((row: { name: string }) => row.name), ["001-foundation.sql", "002-auth.sql"]);
+  });
+
+  test("counts successful and failed auth attempts and returns a retry window", async () => {
+    const { createApp } = await import("../src/app.js");
+    rateLimitServer = createApp().listen(0, "127.0.0.1");
+    await once(rateLimitServer, "listening");
+    const address = rateLimitServer.address();
+    assert.ok(address && typeof address !== "string");
+    const client = new ApiClient(`http://127.0.0.1:${address.port}`);
+    const email = `ratelimit.${process.pid}@example.test`;
+    assert.equal((await client.request("/auth/login", "POST", { email, password: "wrong-password" })).status, 401);
+    assert.equal((await register(client, email)).status, 201);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      assert.equal((await client.request("/auth/login", "POST", { email, password: "A-safe-test-password-123" })).status, 200);
+    }
+    const limited = await client.request("/auth/login", "POST", { email, password: "A-safe-test-password-123" });
+    assert.equal(limited.status, 429);
+    const retryAfter = Number(limited.headers.get("retry-after"));
+    assert.ok(retryAfter > 0 && retryAfter <= 15 * 60, `expected a positive retry time under 15 minutes; got ${retryAfter}`);
+    assert.match(limited.headers.get("access-control-expose-headers") ?? "", /Retry-After/i);
   });
 });

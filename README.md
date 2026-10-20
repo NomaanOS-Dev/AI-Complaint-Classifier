@@ -32,6 +32,8 @@ To stop the services, run `docker compose down`. Database data remains in the `p
 - Roles are `owner`, `admin`, and `member`. Owners and admins may update workspace settings; all workspace members may read that workspace. A user without membership receives `404` for workspace-specific access.
 - Workspace IDs from the browser are always checked against the logged-in user's membership on the server.
 - Authentication routes are rate limited to 10 attempts per 15 minutes per client IP.
+- The current rate-limit counter uses the API process's in-memory store. Login and registration attempts share that counter; a process restart clears it, and multiple API replicas would each keep separate counters. Before scaling a production deployment or relying on lockout state across restarts, configure a shared rate-limit store. The 10-attempt limit remains enabled in this setup.
+- Rate-limit keys use Express's `req.ip`. Forwarded headers are not trusted in local development; Docker Desktop may present host traffic to the container through a shared bridge address, so multiple local clients can share one IP quota. Production trusts one configured proxy hop only when `NODE_ENV=production`; set this to match the actual trusted proxy topology before deployment.
 
 ## Local build checks
 
