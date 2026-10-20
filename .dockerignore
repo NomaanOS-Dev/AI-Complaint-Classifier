@@ -1,0 +1,11 @@
+.git
+.env
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+.venv
+**/__pycache__
+npm-debug.log*
