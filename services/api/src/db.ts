@@ -9,8 +9,16 @@ export async function migrate() {
   const client = await pool.connect();
   try {
     await client.query("CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
-    const migrationsDir = path.resolve(process.cwd(), "migrations");
-    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    let migrationsDir = path.resolve(process.cwd(), "migrations");
+    let migrationFiles: string[];
+    try {
+      migrationFiles = await readdir(migrationsDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      migrationsDir = path.resolve(process.cwd(), "src", "migrations");
+      migrationFiles = await readdir(migrationsDir);
+    }
+    const files = migrationFiles.filter((file) => file.endsWith(".sql")).sort();
     for (const file of files) {
       const alreadyApplied = await client.query("SELECT 1 FROM schema_migrations WHERE name = $1", [file]);
       if (alreadyApplied.rowCount) continue;

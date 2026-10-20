@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "docker compose up --build",
     "build": "npm run build --workspace @nomaanos/web && npm run build --workspace @nomaanos/api",
-    "typecheck": "npm run typecheck --workspace @nomaanos/web && npm run typecheck --workspace @nomaanos/api"
+    "typecheck": "npm run typecheck --workspace @nomaanos/web && npm run typecheck --workspace @nomaanos/api",
+    "test": "npm run test --workspace @nomaanos/api"
   }
 }
