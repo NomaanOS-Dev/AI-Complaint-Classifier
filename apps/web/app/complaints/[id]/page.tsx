@@ -150,17 +150,52 @@ export default function ComplaintDetailPage() {
     catch { setAnalysisError("Could not copy the draft. You can select and copy it manually."); }
   }
 
+  const isCritical = analysis?.priority_label?.toLowerCase() === 'high' || analysis?.priority_label?.toLowerCase() === 'critical' || (analysis?.priority_score && analysis.priority_score >= 75);
+
   return <main className="dashboard-shell complaints-shell">
     <nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><Link className="text-button" href={workspace ? `/complaints?workspace=${workspace.id}` : "/complaints"}>Back to complaints</Link></nav>
-    {busy ? <p className="loading-state">Loading complaint…</p> : <section className="dashboard-content">
+    {busy ? <p className="loading-state">Loading complaint…</p> : <section className="dashboard-content" style={{ maxWidth: '900px' }}>
       <p className="eyebrow">COMPLAINT DETAIL{workspace ? ` · ${workspace.name.toUpperCase()}` : ""}</p>
       {error && <p className="form-error" role="alert">{error}</p>}
+      
       {complaint && <>
-        <article className="workspace-panel detail-panel"><div className="panel-head"><h1>{complaint.title}</h1>{workspace && workspace.role !== "member" ? <label className="detail-status">Status<select value={complaint.status} onChange={(event) => void updateStatus(event.target.value)}>{statuses.map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}</select></label> : <span className={`complaint-status status-${complaint.status}`}>{complaint.status.replace("_", " ")}</span>}</div><p className="detail-description">{complaint.description}</p><dl className="detail-meta"><div><dt>Source</dt><dd>{complaint.source}</dd></div><div><dt>Customer email</dt><dd>{complaint.customer_email ?? "Not provided"}</dd></div><div><dt>Created</dt><dd>{new Date(complaint.created_at).toLocaleString()}</dd></div><div><dt>Updated</dt><dd>{new Date(complaint.updated_at).toLocaleString()}</dd></div></dl></article>
+        <article className="workspace-panel detail-panel">
+          <div className="panel-head">
+            <h1>{complaint.title}</h1>
+            {workspace && workspace.role !== "member" ? (
+              <label className="detail-status">Status
+                <select value={complaint.status} onChange={(event) => void updateStatus(event.target.value)}>
+                  {statuses.map((item) => <option key={item} value={item}>{item.replace("_", " ")}</option>)}
+                </select>
+              </label>
+            ) : (
+              <span className={`complaint-status status-${complaint.status}`}>{complaint.status.replace("_", " ")}</span>
+            )}
+          </div>
+
+          {isCritical && (
+            <div className="critical-alert">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg>
+              <span>Critical Issue: This complaint requires immediate attention due to high priority/severity.</span>
+            </div>
+          )}
+
+          <p className="detail-description">{complaint.description}</p>
+          
+          <dl className="detail-meta-grid">
+            <div className="detail-meta-item"><dt>Source</dt><dd>{complaint.source}</dd></div>
+            <div className="detail-meta-item"><dt>Customer email</dt><dd>{complaint.customer_email ?? "Not provided"}</dd></div>
+            <div className="detail-meta-item"><dt>Created</dt><dd>{new Date(complaint.created_at).toLocaleString()}</dd></div>
+            <div className="detail-meta-item"><dt>Last Updated</dt><dd>{new Date(complaint.updated_at).toLocaleString()}</dd></div>
+          </dl>
+        </article>
+
         <section className="workspace-panel activity-panel" aria-labelledby="activity-heading">
-          <div className="analysis-heading"><div><p className="eyebrow">COMPLAINT HISTORY</p><h2 id="activity-heading">Activity timeline</h2></div></div>
+          <div className="panel-head">
+            <div><p className="eyebrow">HISTORY</p><h2 id="activity-heading">Activity timeline</h2></div>
+          </div>
           {activityError && <p className="form-error" role="alert">{activityError}</p>}
-          {activityLoading && activity.length === 0 ? <p className="loading-state">Loading activity…</p> : activity.length === 0 ? <p className="empty-state">No recorded activity yet. Complaints created before activity tracking may have no history.</p> : <>
+          {activityLoading && activity.length === 0 ? <p className="loading-state">Loading activity…</p> : activity.length === 0 ? <p className="empty-state">No recorded activity yet.</p> : <>
             <ol className="activity-timeline">
               {activity.map((event) => <li className="activity-event" key={event.id}>
                 <div className="activity-event-heading"><strong>{activityTitle(event)}</strong><time dateTime={event.occurred_at}>{new Date(event.occurred_at).toLocaleString()}</time></div>
@@ -172,14 +207,43 @@ export default function ComplaintDetailPage() {
             {activityHasMore && <button className="filter-button" type="button" onClick={() => void loadMoreActivity()} disabled={activityLoading}>{activityLoading ? "Loading…" : "Load more activity"}</button>}
           </>}
         </section>
-        <section className="workspace-panel analysis-panel"><div className="analysis-heading"><div><p className="eyebrow">AI COMPLAINT INTELLIGENCE</p><h2>Analysis</h2></div><button className="primary-link form-submit analysis-action" onClick={() => void runAnalysis()} disabled={analysisBusy || analysisLoading}>{analysisBusy ? "Analysing…" : analysis ? "Re-analyse complaint" : "Analyse complaint"}</button></div>
+
+        <section className="workspace-panel analysis-panel">
+          <div className="panel-head">
+            <div><p className="eyebrow">AI INTELLIGENCE</p><h2>Analysis & Suggested Reply</h2></div>
+            <button className="primary-link" onClick={() => void runAnalysis()} disabled={analysisBusy || analysisLoading}>
+              {analysisBusy ? "Analysing…" : analysis ? "Re-analyse" : "Analyse complaint"}
+            </button>
+          </div>
+
           {analysisError && <p className="form-error" role="alert">{analysisError}</p>}
-          {analysisLoading ? <p className="loading-state">Loading saved analysis…</p> : !analysis ? <p className="empty-state">This complaint has not been analysed yet. Choose “Analyse complaint” to request an OpenAI analysis. No analysis runs automatically; suggested replies remain drafts for human review.</p> : <>
-            <div className="analysis-status"><span className="complaint-status">Analysis ready</span><span>Last analysed {new Date(analysis.analyzed_at).toLocaleString()}</span><span>Method: {analysis.model_name}</span></div>
-            {analysis.model_name === "nomaan-keyword-baseline-v1" && <p className="analysis-notice">Deterministic keyword baseline; heuristic scores are not scientifically validated and are not an LLM prediction.</p>}
-            <dl className="analysis-grid"><div><dt>Category</dt><dd>{analysis.category.replace("_", " ")}</dd></div><div><dt>Sentiment</dt><dd>{analysis.sentiment}</dd></div><div><dt>Severity</dt><dd>{analysis.severity}</dd></div><div><dt>Priority</dt><dd>{analysis.priority_label} · {analysis.priority_score}/100</dd></div></dl>
-            <div className="analysis-summary"><h3>Reasoning summary</h3><p>{analysis.reasoning_summary}</p></div>
-            <div className="suggested-reply"><label htmlFor="suggested-reply">Suggested reply draft <small>Edit before use; this is never sent automatically.</small></label><textarea id="suggested-reply" value={replyDraft} onChange={(event) => setReplyDraft(event.target.value)} maxLength={1200} rows={4} /><button className="filter-button" type="button" onClick={() => void copyReply()}>{copied ? "Copied" : "Copy draft"}</button></div>
+          {analysisLoading ? <p className="loading-state">Loading saved analysis…</p> : !analysis ? <p className="empty-state">This complaint has not been analysed yet. Choose “Analyse complaint” to request an analysis. No analysis runs automatically.</p> : <>
+            
+            <div className="analysis-status">
+              <span className="complaint-status status-resolved" style={{ background: 'var(--accent-soft)', color: 'var(--accent-hover)' }}>Analysis Ready</span>
+              <span>Analyzed {new Date(analysis.analyzed_at).toLocaleString()}</span>
+              <span>Method: {analysis.model_name}</span>
+            </div>
+
+            {analysis.model_name === "nomaan-keyword-baseline-v1" && <p className="analysis-notice" style={{ marginBottom: '20px' }}>Deterministic keyword baseline; heuristic scores are not scientifically validated and are not an LLM prediction.</p>}
+            
+            <dl className="analysis-grid">
+              <div><dt>Category</dt><dd>{analysis.category.replace("_", " ")}</dd></div>
+              <div><dt>Sentiment</dt><dd>{analysis.sentiment}</dd></div>
+              <div><dt>Severity</dt><dd style={{ color: isCritical ? 'var(--danger)' : 'inherit' }}>{analysis.severity}</dd></div>
+              <div><dt>Priority</dt><dd style={{ color: isCritical ? 'var(--danger)' : 'inherit' }}>{analysis.priority_label} · {analysis.priority_score}/100</dd></div>
+            </dl>
+
+            <div className="analysis-summary">
+              <h3>Reasoning Summary</h3>
+              <p>{analysis.reasoning_summary}</p>
+            </div>
+
+            <div className="suggested-reply">
+              <label htmlFor="suggested-reply">Suggested reply draft <small>Edit before use; this is never sent automatically.</small></label>
+              <textarea id="suggested-reply" value={replyDraft} onChange={(event) => setReplyDraft(event.target.value)} maxLength={1200} rows={5} />
+              <button className="filter-button" type="button" onClick={() => void copyReply()}>{copied ? "Copied" : "Copy draft"}</button>
+            </div>
           </>}
         </section>
       </>}
