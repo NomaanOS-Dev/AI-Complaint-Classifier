@@ -203,7 +203,12 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     store: new PgSessionStore({ pool, tableName: "user_sessions", createTableIfMissing: false }),
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, secure: isProduction, sameSite: "lax", maxAge: SESSION_MAX_AGE }
+    cookie: {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: isProduction ? "none" : "lax",
+  maxAge: SESSION_MAX_AGE,
+}
   }));
 
   app.get("/health", async (_req, res) => {
