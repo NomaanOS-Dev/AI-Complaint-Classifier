@@ -1,0 +1,14 @@
+warning: in the working copy of '.env.example', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/web/app/auth.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/web/components/workspace-dashboard.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'apps/web/package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docker-compose.yml', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package-lock.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ai/Dockerfile', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ai/app/main.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/ai/requirements.txt', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/api/package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/api/src/app.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/api/src/server.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'services/api/test/auth.test.ts', LF will be replaced by CRLF the next time Git touches it

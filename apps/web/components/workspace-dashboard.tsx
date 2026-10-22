@@ -54,7 +54,7 @@ export function WorkspaceDashboard() {
   }
 
   return <main className="dashboard-shell">
-    <nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><button className="text-button" onClick={logout}>Log out</button></nav>
+    <nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><div className="complaint-nav"><Link className="text-button" href="/complaints">Complaints</Link><Link className="text-button" href="/analytics">Analytics</Link><Link className="text-button" href="/integrations">Integrations</Link><button className="text-button" onClick={logout}>Log out</button></div></nav>
     {busy ? <p className="loading-state">Loading your workspace…</p> : <section className="dashboard-content">
       <p className="eyebrow">YOUR PRIVATE SPACE</p>
       <h1>Welcome, {user?.name ?? "there"}.</h1>
@@ -62,7 +62,7 @@ export function WorkspaceDashboard() {
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="workspace-grid">
         <section className="workspace-panel"><div className="panel-head"><h2>Your workspaces</h2><span>{workspaces.length.toString().padStart(2, "0")}</span></div>
-          {workspaces.length ? <ul className="workspace-list">{workspaces.map((workspace) => <li key={workspace.id}><span className="workspace-icon">{workspace.name.slice(0, 1).toUpperCase()}</span><span className="workspace-copy"><strong>{workspace.name}</strong><small>{workspace.role}</small></span><span className="workspace-arrow">↗</span></li>)}</ul> : <p className="empty-state">No workspaces yet. Create one to get started.</p>}
+          {workspaces.length ? <ul className="workspace-list">{workspaces.map((workspace) => <li key={workspace.id}><span className="workspace-icon">{workspace.name.slice(0, 1).toUpperCase()}</span><span className="workspace-copy"><strong>{workspace.name}</strong><small>{workspace.role}</small></span><Link className="workspace-arrow" href={`/analytics?workspaceId=${workspace.id}`}>Analytics ↗</Link></li>)}</ul> : <p className="empty-state">No workspaces yet. Create one to get started.</p>}
         </section>
         <section className="workspace-panel create-panel"><p className="eyebrow">ADD A TEAM SPACE</p><h2>Create a workspace</h2><p>Each workspace has its own membership and access boundaries.</p><form onSubmit={createWorkspace}><label htmlFor="workspace-name">Workspace name</label><input id="workspace-name" value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} required maxLength={120} /><button className="primary-link form-submit">Create workspace <span>↗</span></button></form></section>
       </div>

@@ -22,9 +22,23 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://nomaanos:change-this-local-password@db:5432/nomaanos}
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env before starting NomaanOS}
+      NODE_ENV: ${NODE_ENV:-development}
+      INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
+      RESEND_INBOUND_DOMAIN: ${RESEND_INBOUND_DOMAIN:-}
+      PUBLIC_FORM_BASE_URL: ${PUBLIC_FORM_BASE_URL:-http://localhost:3000/contact}
+      PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN:-}
+      META_APP_ID: ${META_APP_ID:-}
+      META_LOGIN_CONFIG_ID: ${META_LOGIN_CONFIG_ID:-}
+      META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v26.0}
+      META_TOKEN_ENCRYPTION_KEY: ${META_TOKEN_ENCRYPTION_KEY:-}
       PORT: 4000
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
       AI_SERVICE_URL: http://ai:8000
+      AI_SERVICE_TIMEOUT_MS: ${AI_SERVICE_TIMEOUT_MS:-30000}
     ports:
       - "${API_PORT:-4000}:4000"
     depends_on:
@@ -40,6 +54,12 @@ services:
     build:
       context: .
       dockerfile: services/ai/Dockerfile
+    environment:
+      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6.1-sol}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.1-flash-lite}
     ports:
       - "${AI_PORT:-8001}:8000"
     healthcheck:
@@ -54,6 +74,7 @@ services:
       dockerfile: apps/web/Dockerfile
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
+      API_INTERNAL_URL: http://api:4000
       NEXT_PUBLIC_AI_URL: ${NEXT_PUBLIC_AI_URL:-http://localhost:8001}
     ports:
       - "${WEB_PORT:-3000}:3000"
