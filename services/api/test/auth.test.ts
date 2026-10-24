@@ -252,7 +252,7 @@ describe("authentication, tenant isolation, and complaints", () => {
     assert.equal(health.status, 200);
     assert.deepEqual(health.body, { status: "ok", service: "api", database: "ok" });
     const migrations = await testPool.query("SELECT name FROM schema_migrations ORDER BY name");
-    assert.deepEqual(migrations.rows.map((row: { name: string }) => row.name), ["001-foundation.sql", "002-auth.sql", "003-complaints.sql", "004-complaint-analysis.sql", "005-complaint-activity.sql", "006-integrations.sql", "007-contact-email-ingestion.sql", "008-embed-contact-forms.sql", "009-meta-social-inbox.sql", "010-whatsapp-embedded-signup.sql"]);
+    assert.deepEqual(migrations.rows.map((row: { name: string }) => row.name), ["001-foundation.sql", "002-auth.sql", "003-complaints.sql", "004-complaint-analysis.sql", "005-complaint-activity.sql", "006-integrations.sql", "007-contact-email-ingestion.sql", "008-embed-contact-forms.sql", "009-meta-social-inbox.sql", "010-whatsapp-embedded-signup.sql", "011-complaint-analysis-jobs.sql"]);
   });
 
   test("counts successful and failed auth attempts and returns a retry window", async () => {
@@ -401,7 +401,7 @@ describe("authentication, tenant isolation, and complaints", () => {
     const anonymous = new ApiClient(origin);
     assert.equal((await anonymous.request(`/workspaces/${workspaceId}/complaints`)).status, 401);
     const migrations = await testPool.query("SELECT name FROM schema_migrations ORDER BY name");
-    assert.deepEqual(migrations.rows.map((row: { name: string }) => row.name), ["001-foundation.sql", "002-auth.sql", "003-complaints.sql", "004-complaint-analysis.sql", "005-complaint-activity.sql", "006-integrations.sql", "007-contact-email-ingestion.sql", "008-embed-contact-forms.sql", "009-meta-social-inbox.sql", "010-whatsapp-embedded-signup.sql"]);
+    assert.deepEqual(migrations.rows.map((row: { name: string }) => row.name), ["001-foundation.sql", "002-auth.sql", "003-complaints.sql", "004-complaint-analysis.sql", "005-complaint-activity.sql", "006-integrations.sql", "007-contact-email-ingestion.sql", "008-embed-contact-forms.sql", "009-meta-social-inbox.sql", "010-whatsapp-embedded-signup.sql", "011-complaint-analysis-jobs.sql"]);
     const { migrate } = await import("../src/db.js");
     await migrate();
     const rerunMigrations = await testPool.query("SELECT name FROM schema_migrations ORDER BY name");

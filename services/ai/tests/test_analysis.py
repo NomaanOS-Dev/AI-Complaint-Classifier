@@ -21,6 +21,7 @@ from app.main import (
     Severity,
     analyze_complaint,
     get_gemini_client,
+    get_ollama_timeout,
     get_openai_client as create_openai_client,
     priority_label_for_score,
 )
@@ -46,7 +47,13 @@ class AnalysisOpenAITests(unittest.IsolatedAsyncioTestCase):
         self.client_patch = patch("app.main.get_openai_client", return_value=self.client)
         self.client_patch.start()
         self.addCleanup(self.client_patch.stop)
-        self.model_patch = patch.dict(os.environ, {"AI_PROVIDER": "openai", "OPENAI_MODEL": "gpt-6.1-sol"})
+        self.model_patch = patch.dict(os.environ, {
+            "AI_PROVIDER": "openai",
+            "OPENAI_MODEL": "gpt-6.1-sol",
+            "OPENAI_API_KEY": "fake-openai-key",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "",
+        })
         self.model_patch.start()
         self.addCleanup(self.model_patch.stop)
 
@@ -173,6 +180,9 @@ class AnalysisGeminiTests(unittest.IsolatedAsyncioTestCase):
         self.provider_patch = patch.dict(os.environ, {
             "AI_PROVIDER": "gemini",
             "GEMINI_MODEL": "gemini-3.1-flash-lite",
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OPENAI_API_KEY": "",
+            "OLLAMA_BASE_URL": "",
         })
         self.provider_patch.start()
         self.addCleanup(self.provider_patch.stop)
@@ -256,6 +266,196 @@ class AnalysisGeminiTests(unittest.IsolatedAsyncioTestCase):
         options = client_factory.call_args.kwargs["http_options"]
         self.assertEqual(options.timeout, 20_000)
         self.assertEqual(options.retry_options.attempts, 1)
+
+
+class AnalysisFallbackAndOllamaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_openai_falls_back_to_gemini_on_rate_limit(self):
+        openai_client = SimpleNamespace(responses=SimpleNamespace(create=AsyncMock()))
+        openai_client.responses.create.side_effect = APIStatusError(
+            "rate limited",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://api.openai.com/v1/responses")),
+            body=None,
+        )
+        gemini_client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=AsyncMock())))
+        gemini_client.aio.models.generate_content.return_value = SimpleNamespace(text=json.dumps(output_payload()))
+
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "fake-openai-key",
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OLLAMA_BASE_URL": "",
+            "AI_PROVIDER": "fallback",
+        }, clear=False):
+            with patch("app.main.get_openai_client", return_value=openai_client), \
+                 patch("app.main.get_gemini_client", return_value=gemini_client):
+                result = await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+                self.assertEqual(result.category, Category.payment)
+                self.assertEqual(result.model_name, "gemini-3.1-flash-lite")
+                openai_client.responses.create.assert_awaited_once()
+                gemini_client.aio.models.generate_content.assert_awaited_once()
+
+    async def test_gemini_falls_back_to_ollama_on_failure(self):
+        gemini_client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=AsyncMock())))
+        gemini_client.aio.models.generate_content.side_effect = genai_errors.APIError(503, {"message": "service unavailable"})
+
+        ollama_response = {
+            "model": "llama3.2:latest",
+            "message": {"role": "assistant", "content": json.dumps(output_payload())},
+            "done": True,
+        }
+
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",  # unconfigured, skip
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OLLAMA_BASE_URL": "http://localhost:11434",
+            "OLLAMA_MODEL": "llama3.2:latest",
+            "AI_PROVIDER": "fallback",
+        }, clear=False):
+            with patch("app.main.get_gemini_client", return_value=gemini_client), \
+                 patch("app.main.asyncio.sleep", new_callable=AsyncMock), \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = httpx.Response(200, json=ollama_response, request=httpx.Request("POST", "http://localhost:11434/api/chat"))
+                result = await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+                self.assertEqual(result.category, Category.payment)
+                self.assertEqual(result.model_name, "ollama-llama3.2-latest")
+                mock_post.assert_awaited_once()
+
+    async def test_full_chain_fallback_openai_to_gemini_to_ollama(self):
+        openai_client = SimpleNamespace(responses=SimpleNamespace(create=AsyncMock()))
+        openai_client.responses.create.side_effect = APITimeoutError(request=None)
+
+        gemini_client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=AsyncMock())))
+        gemini_client.aio.models.generate_content.side_effect = TimeoutError()
+
+        ollama_response = {
+            "model": "llama3.2",
+            "message": {"role": "assistant", "content": json.dumps(output_payload())},
+            "done": True,
+        }
+
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "fake-openai-key",
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OLLAMA_BASE_URL": "http://localhost:11434",
+            "OLLAMA_MODEL": "llama3.2",
+            "AI_PROVIDER": "fallback",
+        }, clear=False):
+            with patch("app.main.get_openai_client", return_value=openai_client), \
+                 patch("app.main.get_gemini_client", return_value=gemini_client), \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = httpx.Response(200, json=ollama_response, request=httpx.Request("POST", "http://localhost:11434/api/chat"))
+                result = await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+                self.assertEqual(result.category, Category.payment)
+                self.assertEqual(result.model_name, "ollama-llama3.2")
+                openai_client.responses.create.assert_awaited_once()
+                gemini_client.aio.models.generate_content.assert_awaited_once()
+                mock_post.assert_awaited_once()
+
+    async def test_all_providers_fail_returns_503(self):
+        openai_client = SimpleNamespace(responses=SimpleNamespace(create=AsyncMock()))
+        openai_client.responses.create.side_effect = APIConnectionError(message="network offline", request=None)
+
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "fake-openai-key",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "http://localhost:11434",
+            "AI_PROVIDER": "fallback",
+        }, clear=False):
+            with patch("app.main.get_openai_client", return_value=openai_client), \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.side_effect = httpx.ConnectError("Connection refused")
+                with self.assertRaises(HTTPException) as caught:
+                    await analyze_complaint(AnalysisRequest(title="Secret title", description="Secret description"))
+                self.assertEqual(caught.exception.status_code, 503)
+                self.assertNotIn("fake-openai-key", caught.exception.detail)
+                self.assertNotIn("Secret", caught.exception.detail)
+
+    async def test_ollama_direct_success_with_qwen_model(self):
+        ollama_response = {
+            "model": "qwen3.8:27b",
+            "message": {"role": "assistant", "content": json.dumps(output_payload())},
+            "done": True,
+        }
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "http://host.docker.internal:11434",
+            "OLLAMA_MODEL": "qwen3.8:27b",
+            "AI_PROVIDER": "ollama",
+        }, clear=False):
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = httpx.Response(200, json=ollama_response, request=httpx.Request("POST", "http://host.docker.internal:11434/api/chat"))
+                result = await analyze_complaint(AnalysisRequest(title="Payment issue", description="Double deduction"))
+                self.assertEqual(result.category, Category.payment)
+                self.assertEqual(result.model_name, "ollama-qwen3.8-27b")
+                mock_post.assert_awaited_once()
+
+    async def test_ollama_missing_model_404_handled_safely(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "http://host.docker.internal:11434",
+            "OLLAMA_MODEL": "non-existent-model",
+            "AI_PROVIDER": "ollama",
+        }, clear=False):
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = httpx.Response(404, json={"error": "model 'non-existent-model' not found"}, request=httpx.Request("POST", "http://host.docker.internal:11434/api/chat"))
+                with self.assertRaises(HTTPException) as caught:
+                    await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+                self.assertEqual(caught.exception.status_code, 502)
+                self.assertIn("not found", caught.exception.detail)
+
+    async def test_ollama_connection_refused_returns_503(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "http://host.docker.internal:11434",
+            "AI_PROVIDER": "ollama",
+        }, clear=False):
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.side_effect = httpx.ConnectError("Connection refused")
+                with self.assertRaises(HTTPException) as caught:
+                    await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+                self.assertEqual(caught.exception.status_code, 503)
+                self.assertIn("temporarily unavailable", caught.exception.detail)
+
+    def test_ollama_timeout_configuration(self):
+        with patch.dict(os.environ, {"OLLAMA_TIMEOUT_SECONDS": "45.0"}, clear=False):
+            t = get_ollama_timeout()
+            self.assertEqual(t.connect, 10.0)
+            self.assertEqual(t.read, 45.0)
+
+        with patch.dict(os.environ, {"OLLAMA_TIMEOUT_SECONDS": "invalid"}, clear=False):
+            t = get_ollama_timeout()
+            self.assertEqual(t.connect, 10.0)
+            self.assertEqual(t.read, 300.0)
+
+    async def test_ollama_timeout_exception_returns_clean_504(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "http://host.docker.internal:11434",
+            "AI_PROVIDER": "ollama",
+        }, clear=False):
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.side_effect = httpx.ReadTimeout("timed out reading response")
+                with self.assertRaises(HTTPException) as caught:
+                    await analyze_complaint(AnalysisRequest(title="Private billing title", description="Private card issue"))
+                self.assertEqual(caught.exception.status_code, 504)
+                self.assertIn("timed out", caught.exception.detail)
+                self.assertNotIn("Private billing title", caught.exception.detail)
+                self.assertNotIn("Private card issue", caught.exception.detail)
+
+    async def test_missing_all_providers_configuration_returns_503(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "",
+            "GEMINI_API_KEY": "",
+            "OLLAMA_BASE_URL": "",
+            "AI_PROVIDER": "",
+        }, clear=False):
+            with self.assertRaises(HTTPException) as caught:
+                await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
+            self.assertEqual(caught.exception.status_code, 503)
+            self.assertIn("not configured", caught.exception.detail)
 
 
 if __name__ == "__main__":

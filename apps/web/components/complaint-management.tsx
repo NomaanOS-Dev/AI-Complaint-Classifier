@@ -6,7 +6,24 @@ import { FormEvent, useEffect, useState } from "react";
 import { apiErrorMessage, apiRequest } from "../lib/api";
 
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
-type Complaint = { id: string; title: string; description: string; customer_name?: string | null; customer_email: string | null; submitted_category?: string | null; source: string; status: string; created_at: string; analysis_category?: string | null; analysis_priority_label?: string | null; analysis_priority_score?: number | null; analysis_analyzed_at?: string | null };
+type Complaint = {
+  id: string;
+  title: string;
+  description: string;
+  customer_name?: string | null;
+  customer_email: string | null;
+  submitted_category?: string | null;
+  source: string;
+  status: string;
+  created_at: string;
+  analysis_category?: string | null;
+  analysis_priority_label?: string | null;
+  analysis_priority_score?: number | null;
+  analysis_analyzed_at?: string | null;
+  analysis_status?: "pending" | "processing" | "completed" | "failed" | null;
+  analysis_error?: string | null;
+  analysis_model_name?: string | null;
+};
 const statuses = ["open", "in_progress", "resolved", "closed"];
 
 export function ComplaintManagement() {
@@ -57,6 +74,29 @@ export function ComplaintManagement() {
     return () => { cancelled = true; };
   }, [workspaceId, offset, statusFilter, search, router]);
 
+  useEffect(() => {
+    if (!workspaceId) return;
+    const hasPending = complaints.some(
+      (c) => c.analysis_status === "pending" || c.analysis_status === "processing"
+    );
+    if (!hasPending) return;
+
+    const interval = setInterval(() => {
+      const params = new URLSearchParams({ limit: "20", offset: String(offset) });
+      if (statusFilter) params.set("status", statusFilter);
+      if (search) params.set("q", search);
+      apiRequest<{ complaints: Complaint[]; pagination: { hasMore: boolean } }>(
+        `/workspaces/${workspaceId}/complaints?${params}`
+      ).then(({ data, response }) => {
+        if (response.ok && data.complaints) {
+          setComplaints(data.complaints);
+        }
+      }).catch(() => { /* silent poll */ });
+    }, 4000);
+
+    return () => clearInterval(interval);
+  }, [workspaceId, complaints, offset, statusFilter, search]);
+
   async function createComplaint(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); if (!workspaceId || saving) return;
     setSaving(true); setError("");
@@ -103,9 +143,23 @@ export function ComplaintManagement() {
                     <small>
                       {item.analysis_category ? (
                         <span style={{ color: isHighPriority ? 'var(--danger)' : 'inherit', fontWeight: isHighPriority ? 600 : 'inherit' }}>
-                          Analysis: {item.analysis_category.replace("_", " ")} · {item.analysis_priority_label} {item.analysis_priority_score}/100
+                          Analysis: {item.analysis_category.replace("_", " ")} · {item.analysis_priority_label} {item.analysis_priority_score}/100{item.analysis_model_name ? ` (${item.analysis_model_name})` : ""}
                         </span>
-                      ) : "Not analysed"}
+                      ) : item.analysis_status === "processing" ? (
+                        <span style={{ color: "var(--accent, #6366f1)", fontWeight: 500 }}>
+                          ⚙️ Analyzing…
+                        </span>
+                      ) : item.analysis_status === "pending" ? (
+                        <span style={{ color: "var(--muted, #888)" }}>
+                          ⏳ Analysis queued
+                        </span>
+                      ) : item.analysis_status === "failed" ? (
+                        <span style={{ color: "var(--danger, #ef4444)" }}>
+                          ⚠️ Analysis failed{item.analysis_error ? `: ${item.analysis_error}` : ""}
+                        </span>
+                      ) : (
+                        "Not analysed"
+                      )}
                     </small>
                   </div>
                   {activeWorkspace && activeWorkspace.role !== "member" ? <select aria-label={`Status for ${item.title}`} value={item.status} onChange={(event) => void changeStatus(item, event.target.value)}>{statuses.map((value) => <option key={value} value={value}>{value.replace("_", " ")}</option>)}</select> : <span className={`complaint-status status-${item.status}`}>{item.status.replace("_", " ")}</span>}

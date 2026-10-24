@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+import re
 from datetime import datetime, timezone
 from enum import Enum
 
@@ -122,11 +124,29 @@ Priority rubric: choose a score from 0 to 100 based on the actual impact and urg
 Give a concise explanation grounded in complaint facts, with no unsupported certainty. Draft a specific, professional, empathetic reply addressing the stated problem. Ask for relevant missing information when useful. Never invent transaction IDs, policies, refunds, investigations, or completed actions. Suggested replies are drafts for human review."""
 
 app = FastAPI(title="NomaanOS AI Service", version="0.3.0")
+logger = logging.getLogger("nomaanos.ai")
 _openai_client: AsyncOpenAI | None = None
 _gemini_client: genai.Client | None = None
 GEMINI_TIMEOUT_SECONDS = 20
 GEMINI_TOTAL_TIMEOUT_SECONDS = 25
 GEMINI_MAX_ATTEMPTS = 3
+OLLAMA_DEFAULT_TIMEOUT_SECONDS = 300.0
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "300.0"))
+
+
+def get_ollama_timeout() -> httpx.Timeout:
+    try:
+        raw = os.getenv("OLLAMA_TIMEOUT_SECONDS")
+        timeout_seconds = float(raw.strip()) if raw is not None and raw.strip() else OLLAMA_TIMEOUT_SECONDS
+    except (ValueError, TypeError):
+        timeout_seconds = OLLAMA_DEFAULT_TIMEOUT_SECONDS
+    return httpx.Timeout(timeout_seconds, connect=10.0)
+
+
+def sanitize_model_name(name: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9._-]", "-", name.lower().strip())
+    cleaned = re.sub(r"^[^a-z0-9]+", "", cleaned)
+    return cleaned[:64] or "unknown-model"
 
 
 @app.exception_handler(RequestValidationError)
@@ -173,11 +193,60 @@ def get_gemini_client() -> genai.Client:
     return _gemini_client
 
 
+def is_provider_configured(provider: str) -> bool:
+    if provider == "openai":
+        return bool(os.getenv("OPENAI_API_KEY", "").strip())
+    if provider == "gemini":
+        return bool(os.getenv("GEMINI_API_KEY", "").strip())
+    if provider == "ollama":
+        return bool(os.getenv("OLLAMA_BASE_URL", "").strip()) or os.getenv("AI_PROVIDER", "").strip().lower() == "ollama"
+    return False
+
+
+def get_provider_chain() -> list[str]:
+    base_chain = ["openai", "gemini", "ollama"]
+    provider = os.getenv("AI_PROVIDER", "").strip().lower()
+    if provider in {"openai", "gemini", "ollama"}:
+        remaining = [p for p in base_chain if p != provider]
+        return [provider] + remaining
+    return base_chain
+
+
 def selected_provider() -> str:
     provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
-    if provider not in {"openai", "gemini"}:
-        raise HTTPException(status_code=503, detail="AI_PROVIDER must be configured as 'openai' or 'gemini'.")
+    if provider not in {"openai", "gemini", "ollama", "fallback", "all"}:
+        raise HTTPException(status_code=503, detail="AI_PROVIDER must be configured as 'openai', 'gemini', 'ollama', or 'fallback'.")
     return provider
+
+
+async def request_openai_analysis(client: AsyncOpenAI, model_name: str, complaint_json: str) -> str:
+    try:
+        result = await client.responses.create(
+            model=model_name,
+            instructions=SYSTEM_INSTRUCTIONS,
+            input=[{"role": "user", "content": complaint_json}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "complaint_analysis",
+                    "strict": True,
+                    "schema": ANALYSIS_SCHEMA,
+                }
+            },
+            max_output_tokens=800,
+            store=False,
+        )
+        return result.output_text
+    except APITimeoutError as exc:
+        raise HTTPException(status_code=504, detail="AI analysis timed out. Please retry later.") from exc
+    except APIConnectionError as exc:
+        raise HTTPException(status_code=503, detail="AI provider is temporarily unavailable.") from exc
+    except APIStatusError as exc:
+        status = 503 if exc.status_code == 429 or exc.status_code >= 500 else 502
+        message = "AI provider is temporarily unavailable." if status == 503 else "AI provider returned an invalid analysis response."
+        raise HTTPException(status_code=status, detail=message) from exc
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.") from exc
 
 
 async def request_gemini_analysis(client: genai.Client, model_name: str, complaint_json: str) -> str:
@@ -212,56 +281,103 @@ async def request_gemini_analysis(client: genai.Client, model_name: str, complai
     raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.")
 
 
+async def request_ollama_analysis(base_url: str, model_name: str, complaint_json: str) -> str:
+    url = f"{base_url.rstrip('/')}/api/chat"
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+            {"role": "user", "content": complaint_json},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {
+            "temperature": 0.1,
+            "num_predict": 600,
+        },
+    }
+    timeout = get_ollama_timeout()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, json=payload)
+            if response.status_code == 404:
+                raise HTTPException(status_code=502, detail=f"Ollama model '{model_name}' not found.")
+            if response.status_code >= 500 or response.status_code == 429:
+                raise HTTPException(status_code=503, detail="AI provider is temporarily unavailable.")
+            response.raise_for_status()
+            data = response.json()
+            message = data.get("message", {})
+            content = message.get("content", "")
+            if not content:
+                raise HTTPException(status_code=502, detail="AI provider returned an empty response.")
+            return content
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="AI analysis timed out. Please retry later.") from exc
+    except (httpx.ConnectError, httpx.NetworkError) as exc:
+        raise HTTPException(status_code=503, detail="AI provider is temporarily unavailable.") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.") from exc
+
+
 async def analyze_complaint(request: AnalysisRequest) -> AnalysisResponse:
-    provider = selected_provider()
     complaint_json = json.dumps(
         {"title": request.title, "description": request.description},
         ensure_ascii=False,
     )
-    if provider == "gemini":
-        model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
-        result_text = await request_gemini_analysis(get_gemini_client(), model_name, complaint_json)
-    else:
-        model_name = os.getenv("OPENAI_MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol"
-        client = get_openai_client()
+    chain = get_provider_chain()
+
+    last_error: HTTPException | None = None
+    attempted_providers = 0
+
+    for provider in chain:
+        if not is_provider_configured(provider):
+            continue
+
+        attempted_providers += 1
         try:
-            result = await client.responses.create(
-                model=model_name,
-                instructions=SYSTEM_INSTRUCTIONS,
-                input=[{"role": "user", "content": complaint_json}],
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "complaint_analysis",
-                        "strict": True,
-                        "schema": ANALYSIS_SCHEMA,
-                    }
-                },
-                max_output_tokens=800,
-                store=False,
+            if provider == "openai":
+                model_name = os.getenv("OPENAI_MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol"
+                client = get_openai_client()
+                result_text = await request_openai_analysis(client, model_name, complaint_json)
+                resolved_model = sanitize_model_name(model_name)
+            elif provider == "gemini":
+                model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip() or "gemini-3.1-flash-lite"
+                client = get_gemini_client()
+                result_text = await request_gemini_analysis(client, model_name, complaint_json)
+                resolved_model = sanitize_model_name(model_name)
+            elif provider == "ollama":
+                base_url = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434").strip() or "http://host.docker.internal:11434"
+                raw_model = os.getenv("OLLAMA_MODEL", "qwen3.8:27b").strip() or "qwen3.8:27b"
+                result_text = await request_ollama_analysis(base_url, raw_model, complaint_json)
+                resolved_model = sanitize_model_name(f"ollama-{raw_model}")
+            else:
+                continue
+
+            parsed = ModelAnalysis.model_validate_json(result_text)
+            return AnalysisResponse(
+                **parsed.model_dump(),
+                model_name=resolved_model,
+                analyzed_at=datetime.now(timezone.utc),
             )
-        except APITimeoutError as exc:
-            raise HTTPException(status_code=504, detail="AI analysis timed out. Please retry later.") from exc
-        except APIConnectionError as exc:
-            raise HTTPException(status_code=503, detail="AI provider is temporarily unavailable.") from exc
-        except APIStatusError as exc:
-            status = 503 if exc.status_code == 429 or exc.status_code >= 500 else 502
-            message = "AI provider is temporarily unavailable." if status == 503 else "AI provider returned an invalid analysis response."
-            raise HTTPException(status_code=status, detail=message) from exc
-        except OpenAIError as exc:
-            raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.") from exc
-        result_text = result.output_text
+        except HTTPException as exc:
+            logger.warning("AI provider '%s' failed with status %d: %s", provider, exc.status_code, exc.detail)
+            last_error = exc
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger.warning("AI provider '%s' returned invalid analysis format: %s", provider, type(exc).__name__)
+            last_error = HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.")
+        except Exception as exc:
+            logger.warning("AI provider '%s' failed unexpectedly: %s", provider, type(exc).__name__)
+            last_error = HTTPException(status_code=503, detail="AI provider is temporarily unavailable.")
 
-    try:
-        parsed = ModelAnalysis.model_validate_json(result_text)
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.") from exc
+    if attempted_providers == 0:
+        raise HTTPException(status_code=503, detail="AI analysis is not configured on the server.")
 
-    return AnalysisResponse(
-        **parsed.model_dump(),
-        model_name=model_name,
-        analyzed_at=datetime.now(timezone.utc),
-    )
+    if last_error is not None:
+        raise last_error
+
+    raise HTTPException(status_code=503, detail="AI provider is temporarily unavailable.")
 
 
 @app.post("/analyze", response_model=AnalysisResponse)

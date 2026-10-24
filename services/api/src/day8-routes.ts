@@ -3,6 +3,7 @@ import type { Application, Request, RequestHandler, Response } from "express";
 import { decryptWebhookSecret, encryptWebhookSecret } from "./integration-security.js";
 import { generateOpaqueRoutingToken, hashClientAddress, sha256 } from "./day8-ingestion.js";
 import { pool } from "./db.js";
+import { enqueueComplaintAnalysis } from "./complaint-analysis-worker.js";
 
 type Middleware = RequestHandler;
 type RouteOptions = {
@@ -370,6 +371,7 @@ export function mountDay8Routes(app: Application, options: RouteOptions) {
         [complaint.rows[0].id, form.workspace_id, form.created_by]
       );
       await options.enqueueWebhookDeliveries(client, activity.rows[0].id, form.workspace_id);
+      await enqueueComplaintAnalysis(client, complaint.rows[0].id, form.workspace_id);
       const responseBody = { status: "accepted", reference: randomBytes(9).toString("hex") };
       await client.query(
         `INSERT INTO public_contact_idempotency(form_id,workspace_id,idempotency_key,payload_hash,complaint_id,response_body,expires_at)

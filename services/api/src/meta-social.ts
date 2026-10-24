@@ -3,6 +3,7 @@ import type { Application, Request, RequestHandler, Response } from "express";
 import express from "express";
 import { pool } from "./db.js";
 import { createWhatsAppGraphApi, revokeWhatsAppSubscription } from "./meta-whatsapp.js";
+import { enqueueComplaintAnalysis } from "./complaint-analysis-worker.js";
 
 type Provider = "whatsapp" | "instagram";
 type SocialMessage = {
@@ -215,6 +216,7 @@ async function persistSocialMessage(message: SocialMessage, enqueueWebhookDelive
         [complaintId, connection.workspace_id, connection.created_by, JSON.stringify({ source: message.provider })]
       );
       await enqueueWebhookDeliveries(client, createdActivity.rows[0].id, connection.workspace_id);
+      await enqueueComplaintAnalysis(client, complaintId, connection.workspace_id);
       conversation = await client.query<{ id: string; complaint_id: string }>(
         `INSERT INTO meta_social_conversations
            (connection_id, workspace_id, external_conversation_id, external_sender_id, complaint_id)

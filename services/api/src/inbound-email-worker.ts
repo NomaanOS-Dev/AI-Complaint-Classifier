@@ -50,14 +50,20 @@ async function processEvent(event: QueueEvent, fetchEmail: InboundEmailFetcher) 
     await setRejected(event, "recipient_mismatch"); return;
   }
   const sender = parseSender(email.from);
-  if (!sender || email.subject.length > 200) { await setRejected(event, "invalid_sender_or_subject"); return; }
+  if (!sender) { await setRejected(event, "invalid_sender"); return; }
+  const rawSubject = typeof email.subject === "string" ? email.subject.trim() : "";
+  const subject = rawSubject.length > 0 ? rawSubject : "(No subject)";
+  if (subject.length > 200) { await setRejected(event, "subject_too_long"); return; }
   const suppress = inboundSuppressionReason(email.headers, email.from);
   if (suppress) { await setRejected(event, `suppressed_${suppress}`); return; }
   const attachments = inspectAttachmentMetadata(email.attachments);
   if (attachments === null) { await setRejected(event, "invalid_attachment_metadata"); return; }
   const text = typeof email.text === "string" && email.text.trim() ? email.text.trim() : typeof email.html === "string" ? extractPlainText(email.html) : "";
-  if (!text) throw new Error("body_unavailable");
-  if (text.length > 10_000 || email.subject.trim().length < 1) { await setRejected(event, "message_too_long_or_empty", attachments); return; }
+  if (!text) {
+    await setRejected(event, "empty_message_body", attachments ?? []);
+    return;
+  }
+  if (text.length > 10_000) { await setRejected(event, "message_too_long", attachments); return; }
 
   const client = await pool.connect();
   try {
@@ -74,7 +80,7 @@ async function processEvent(event: QueueEvent, fetchEmail: InboundEmailFetcher) 
     const complaint = await client.query<{ id: string }>(
       `INSERT INTO complaints(workspace_id,title,description,customer_name,customer_email,source,created_by)
        VALUES($1,$2,$3,$4,$5,'inbound_email',$6) RETURNING id`,
-      [event.workspace_id, email.subject.trim(), text, sender.name, sender.email, route.created_by]
+      [event.workspace_id, subject, text, sender.name, sender.email, route.created_by]
     );
     await enqueueComplaintAnalysis(client, complaint.rows[0].id, event.workspace_id);
     const activity = await client.query<{ id: string }>(

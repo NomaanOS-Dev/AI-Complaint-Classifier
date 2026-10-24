@@ -5,12 +5,36 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { apiErrorMessage, apiRequest } from "../../../lib/api";
 
-type Complaint = { id: string; title: string; description: string; customer_email: string | null; source: string; status: string; created_at: string; updated_at: string };
+type Complaint = {
+  id: string;
+  title: string;
+  description: string;
+  customer_email: string | null;
+  source: string;
+  status: string;
+  created_at: string;
+  updated_at: string;
+  analysis_status?: "pending" | "processing" | "completed" | "failed" | null;
+  analysis_error?: string | null;
+  analysis_model_name?: string | null;
+};
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
 type Analysis = {
   category: string; sentiment: string; severity: string; priority_score: number; priority_label: string;
   reasoning_summary: string; suggested_reply: string; model_name: string; analyzed_at: string;
 };
+type AnalysisJob = {
+  status: "pending" | "processing" | "completed" | "failed";
+  error: string | null;
+};
+
+function formatModelName(model: string) {
+  if (model.startsWith("gpt-") || model.includes("openai")) return `OpenAI (${model})`;
+  if (model.startsWith("gemini")) return `Google Gemini (${model})`;
+  if (model.startsWith("ollama-")) return `Ollama (${model.replace(/^ollama-/, "")})`;
+  if (model === "nomaan-keyword-baseline-v1") return "Keyword Baseline";
+  return model;
+}
 type ActivityEvent = {
   id: string; event_type: "complaint_created" | "status_changed" | "analysis_completed" | "social_message_received";
   actor_user_id: string; actor_name: string | null; occurred_at: string;
@@ -32,6 +56,7 @@ export default function ComplaintDetailPage() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [complaint, setComplaint] = useState<Complaint | null>(null);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [analysisJob, setAnalysisJob] = useState<AnalysisJob | null>(null);
   const [activity, setActivity] = useState<ActivityEvent[]>([]);
   const [activityCursor, setActivityCursor] = useState<string | null>(null);
   const [activityHasMore, setActivityHasMore] = useState(false);
@@ -61,12 +86,13 @@ export default function ComplaintDetailPage() {
       if (!detail.response.ok || !detail.data.complaint) throw new Error(apiErrorMessage(detail.data, "Workspace or complaint not found."));
       if (cancelled) return;
       setWorkspace(active); setComplaint(detail.data.complaint);
-      const saved = await apiRequest<{ analysis: Analysis | null; error?: string }>(`/workspaces/${active.id}/complaints/${params.id}/analysis`);
+      const saved = await apiRequest<{ analysis: Analysis | null; job?: AnalysisJob | null; error?: string }>(`/workspaces/${active.id}/complaints/${params.id}/analysis`);
       if (saved.response.status === 401) { router.replace("/login"); return; }
       if (!saved.response.ok) {
         setAnalysisError(apiErrorMessage(saved.data, "Could not load saved analysis."));
       } else {
         setAnalysis(saved.data.analysis);
+        if (saved.data.job) setAnalysisJob(saved.data.job);
         setReplyDraft(saved.data.analysis?.suggested_reply ?? "");
       }
       try {
@@ -88,6 +114,32 @@ export default function ComplaintDetailPage() {
       .finally(() => { if (!cancelled) { setBusy(false); setAnalysisLoading(false); } });
     return () => { cancelled = true; };
   }, [params.id, router]);
+
+  useEffect(() => {
+    if (!workspace || !complaint || analysis) return;
+    const isJobActive = analysisJob?.status === "pending" || analysisJob?.status === "processing" ||
+      complaint.analysis_status === "pending" || complaint.analysis_status === "processing";
+    if (!isJobActive) return;
+
+    const interval = setInterval(() => {
+      apiRequest<{ analysis: Analysis | null; job?: AnalysisJob | null; error?: string }>(
+        `/workspaces/${workspace.id}/complaints/${complaint.id}/analysis`
+      ).then(({ data, response }) => {
+        if (response.ok) {
+          if (data.analysis) {
+            setAnalysis(data.analysis);
+            setReplyDraft(data.analysis.suggested_reply);
+            setAnalysisJob({ status: "completed", error: null });
+            void refreshActivity(workspace.id, complaint.id);
+          } else if (data.job) {
+            setAnalysisJob(data.job);
+          }
+        }
+      }).catch(() => { /* silent poll */ });
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [workspace, complaint, analysis, analysisJob]);
 
   async function refreshActivity(workspaceId: string, complaintId: string) {
     setActivityLoading(true); setActivityError("");
@@ -139,9 +191,11 @@ export default function ComplaintDetailPage() {
       if (response.status === 401) { router.replace("/login"); return; }
       if (!response.ok || !data.analysis) throw new Error(apiErrorMessage(data, "Could not analyze complaint. You can retry manually."));
       setAnalysis(data.analysis); setReplyDraft(data.analysis.suggested_reply);
+      setAnalysisJob({ status: "completed", error: null });
       await refreshActivity(workspace.id, complaint.id);
     } catch (caught) {
       setAnalysisError(caught instanceof Error ? caught.message : "Could not analyze complaint. You can retry manually.");
+      setAnalysisJob({ status: "failed", error: caught instanceof Error ? caught.message : "Analysis failed" });
     } finally { setAnalysisBusy(false); }
   }
 
@@ -217,12 +271,31 @@ export default function ComplaintDetailPage() {
           </div>
 
           {analysisError && <p className="form-error" role="alert">{analysisError}</p>}
-          {analysisLoading ? <p className="loading-state">Loading saved analysis…</p> : !analysis ? <p className="empty-state">This complaint has not been analysed yet. Choose “Analyse complaint” to request an analysis. No analysis runs automatically.</p> : <>
+          {analysisLoading ? <p className="loading-state">Loading saved analysis…</p> : !analysis ? (
+            analysisJob?.status === "processing" || complaint?.analysis_status === "processing" ? (
+              <div className="analysis-status-card" style={{ padding: '16px', background: 'var(--panel-subtle, rgba(255,255,255,0.03))', borderRadius: '8px' }}>
+                <span className="complaint-status status-in_progress" style={{ marginBottom: '8px', display: 'inline-block' }}>⚙️ Analyzing…</span>
+                <p>An AI model is analyzing this complaint in the background. Results will appear automatically.</p>
+              </div>
+            ) : analysisJob?.status === "pending" || complaint?.analysis_status === "pending" ? (
+              <div className="analysis-status-card" style={{ padding: '16px', background: 'var(--panel-subtle, rgba(255,255,255,0.03))', borderRadius: '8px' }}>
+                <span className="complaint-status" style={{ marginBottom: '8px', display: 'inline-block' }}>⏳ Analysis queued</span>
+                <p>This complaint is queued for automatic AI analysis. Checking for results…</p>
+              </div>
+            ) : (analysisJob?.status === "failed" || complaint?.analysis_status === "failed") ? (
+              <div className="analysis-status-card" style={{ padding: '16px', background: 'var(--panel-subtle, rgba(255,255,255,0.03))', borderRadius: '8px', borderLeft: '3px solid var(--danger, #ef4444)' }}>
+                <span className="complaint-status status-closed" style={{ marginBottom: '8px', display: 'inline-block' }}>⚠️ Analysis failed</span>
+                <p>{analysisJob?.error || complaint?.analysis_error || "Analysis encountered a provider error."} Click “Analyse complaint” above to retry.</p>
+              </div>
+            ) : (
+              <p className="empty-state">This complaint has not been analysed yet. Choose “Analyse complaint” above to generate an AI analysis.</p>
+            )
+          ) : <>
             
             <div className="analysis-status">
               <span className="complaint-status status-resolved" style={{ background: 'var(--accent-soft)', color: 'var(--accent-hover)' }}>Analysis Ready</span>
               <span>Analyzed {new Date(analysis.analyzed_at).toLocaleString()}</span>
-              <span>Method: {analysis.model_name}</span>
+              <span>Provider: {formatModelName(analysis.model_name)}</span>
             </div>
 
             {analysis.model_name === "nomaan-keyword-baseline-v1" && <p className="analysis-notice" style={{ marginBottom: '20px' }}>Deterministic keyword baseline; heuristic scores are not scientifically validated and are not an LLM prediction.</p>}

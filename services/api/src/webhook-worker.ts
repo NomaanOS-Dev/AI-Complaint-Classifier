@@ -122,4 +122,8 @@ export function startWebhookWorker() {
     })().catch(() => console.error("Integration retention cleanup failed"));
   }, 6 * 60 * 60 * 1000);
   workerTimer.unref(); cleanupTimer.unref();
+  return () => {
+    clearInterval(workerTimer);
+    clearInterval(cleanupTimer);
+  };
 }

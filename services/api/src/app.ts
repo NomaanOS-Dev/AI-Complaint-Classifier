@@ -14,6 +14,7 @@ import {
   encryptWebhookSecret, generateIntegrationCredential, hashIntegrationCredential,
   hasIntegrationEncryptionKey, integrationEventTypes, isValidCredentialFormat, resolveSafeWebhookUrl
 } from "./integration-security.js";
+import { enqueueComplaintAnalysis, persistComplaintAnalysis } from "./complaint-analysis-worker.js";
 
 const PgSessionStore = connectPgSimple(session);
 const SESSION_COOKIE = "nomaanos.sid";
@@ -26,12 +27,14 @@ type WorkspaceRow = { id: string; name: string; role?: "owner" | "admin" | "memb
 type ComplaintRow = {
   id: string; workspace_id: string; title: string; description: string; customer_email: string | null;
   customer_name?: string | null; submitted_category?: string | null;
-  source: "manual" | "contact_form" | "inbound_email"; status: "open" | "in_progress" | "resolved" | "closed"; created_by: string;
+  source: "manual" | "contact_form" | "inbound_email" | "whatsapp" | "instagram"; status: "open" | "in_progress" | "resolved" | "closed"; created_by: string;
   created_at: string; updated_at: string;
+  analysis_status?: string | null; analysis_error?: string | null; analysis_model_name?: string | null;
 };
 type ComplaintListRow = ComplaintRow & {
   analysis_category: string | null; analysis_priority_label: string | null;
   analysis_priority_score: number | null; analysis_analyzed_at: string | null;
+  analysis_model_name?: string | null; analysis_status?: string | null; analysis_error?: string | null;
 };
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const complaintStatuses = ["open", "in_progress", "resolved", "closed"] as const;
@@ -305,7 +308,7 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
 
   app.post("/auth/logout", csrfProtection, asyncRoute(async (req, res) => {
     await new Promise<void>((resolve, reject) => req.session.destroy((error) => error ? reject(error) : resolve()));
-    res.clearCookie(SESSION_COOKIE, { httpOnly: true, secure: isProduction, sameSite: "lax", path: "/" });
+    res.clearCookie(SESSION_COOKIE, { httpOnly: true, secure: isProduction, sameSite: isProduction ? "none" : "lax", path: "/" });
     res.status(204).end();
   }));
 
@@ -774,6 +777,7 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         [complaint.id, credential.workspace_id, credential.created_by, JSON.stringify({ integrationCredentialId: credential.id })]
       );
       await enqueueWebhookDeliveries(client, event.rows[0].id, credential.workspace_id);
+      await enqueueComplaintAnalysis(client, complaint.id, credential.workspace_id);
       const responseBody = { complaint: { id: complaint.id, status: complaint.status, createdAt: complaint.created_at } };
       await client.query(
         `INSERT INTO integration_idempotency (workspace_id, credential_id, idempotency_key, payload_hash, complaint_id, response_body, expires_at)
@@ -815,8 +819,9 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         [complaint.id, complaint.workspace_id, user.id]
       );
       await enqueueWebhookDeliveries(client, activity.rows[0].id, complaint.workspace_id);
+      await enqueueComplaintAnalysis(client, complaint.id, complaint.workspace_id);
       await client.query("COMMIT");
-      res.status(201).json({ complaint });
+      res.status(201).json({ complaint: { ...complaint, analysis_status: "pending" } });
     } catch (error) {
       await client.query("ROLLBACK");
       throw error;
@@ -841,8 +846,12 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     const result = await pool.query<ComplaintListRow>(
       `SELECT c.id, c.workspace_id, c.title, c.description, c.customer_name, c.customer_email, c.submitted_category, c.source, c.status, c.created_by, c.created_at, c.updated_at,
               ca.category AS analysis_category, ca.priority_label AS analysis_priority_label,
-              ca.priority_score AS analysis_priority_score, ca.analyzed_at AS analysis_analyzed_at
-       FROM complaints c LEFT JOIN complaint_analyses ca ON ca.complaint_id = c.id
+              ca.priority_score AS analysis_priority_score, ca.analyzed_at AS analysis_analyzed_at,
+              ca.model_name AS analysis_model_name,
+              j.status AS analysis_status, j.error_code AS analysis_error
+       FROM complaints c
+       LEFT JOIN complaint_analyses ca ON ca.complaint_id = c.id
+       LEFT JOIN complaint_analysis_jobs j ON j.complaint_id = c.id
        WHERE c.workspace_id = $1
          AND ($2::text IS NULL OR c.status = $2)
          AND ($3::text = '' OR c.title ILIKE '%' || $3 || '%' OR c.description ILIKE '%' || $3 || '%')
@@ -859,8 +868,13 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       return;
     }
     const result = await pool.query<ComplaintRow>(
-      `SELECT id, workspace_id, title, description, customer_name, customer_email, submitted_category, source, status, created_by, created_at, updated_at
-       FROM complaints WHERE id = $1 AND workspace_id = $2`,
+      `SELECT c.id, c.workspace_id, c.title, c.description, c.customer_name, c.customer_email, c.submitted_category, c.source, c.status, c.created_by, c.created_at, c.updated_at,
+              ca.model_name AS analysis_model_name,
+              j.status AS analysis_status, j.error_code AS analysis_error
+       FROM complaints c
+       LEFT JOIN complaint_analyses ca ON ca.complaint_id = c.id
+       LEFT JOIN complaint_analysis_jobs j ON j.complaint_id = c.id
+       WHERE c.id = $1 AND c.workspace_id = $2`,
       [complaintId, String(req.params.workspaceId)]
     );
     if (!result.rows[0]) {
@@ -933,10 +947,13 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       res.status(404).json({ error: "Complaint not found" });
       return;
     }
-    const result = await pool.query<ComplaintAnalysis & { complaint_id: string }>(
+    const result = await pool.query<ComplaintAnalysis & { complaint_id: string; job_status: string | null; job_error: string | null }>(
       `SELECT ca.complaint_id, ca.category, ca.sentiment, ca.severity, ca.priority_score, ca.priority_label,
-              ca.reasoning_summary, ca.suggested_reply, ca.model_name, ca.analyzed_at
-       FROM complaints c LEFT JOIN complaint_analyses ca ON ca.complaint_id = c.id
+              ca.reasoning_summary, ca.suggested_reply, ca.model_name, ca.analyzed_at,
+              j.status AS job_status, j.error_code AS job_error
+       FROM complaints c
+       LEFT JOIN complaint_analyses ca ON ca.complaint_id = c.id
+       LEFT JOIN complaint_analysis_jobs j ON j.complaint_id = c.id
        WHERE c.id = $1 AND c.workspace_id = $2`,
       [complaintId, String(req.params.workspaceId)]
     );
@@ -944,8 +961,14 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       res.status(404).json({ error: "Complaint not found" });
       return;
     }
-    const { complaint_id: _complaintId, ...analysis } = result.rows[0];
-    res.json({ analysis: _complaintId ? analysis : null });
+    const { complaint_id: _complaintId, job_status, job_error, ...analysis } = result.rows[0];
+    res.json({
+      analysis: _complaintId ? analysis : null,
+      job: {
+        status: job_status ?? (_complaintId ? "completed" : "pending"),
+        error: job_error ?? null
+      }
+    });
   }));
 
   app.post("/workspaces/:workspaceId/complaints/:complaintId/analysis", requireAuth, csrfProtection, requireWorkspaceRole(["owner", "admin", "member"]), asyncRoute(async (req, res) => {
@@ -974,10 +997,11 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     }
     activeAnalysisRequests.add(complaintId);
     try {
-      const configuredTimeout = Number(process.env.AI_SERVICE_TIMEOUT_MS ?? 30000);
-      const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout >= 100 && configuredTimeout <= 30000 ? configuredTimeout : 30000;
+      const configuredTimeout = Number(process.env.AI_SERVICE_TIMEOUT_MS ?? 45000);
+      const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout >= 100 && configuredTimeout <= 60000 ? configuredTimeout : 45000;
       const serviceUrl = process.env.AI_SERVICE_URL ?? "http://localhost:8001";
       let analysis: unknown;
+      let failureCode = "processing_failed";
       try {
         const response = await fetch(`${serviceUrl.replace(/\/$/, "")}/analyze`, {
           method: "POST",
@@ -987,21 +1011,44 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         });
         const responseBody = await response.text();
         if (responseBody.length > 16000) {
+          await pool.query(
+            `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = 'oversized_response', locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+            [complaintId]
+          );
           res.status(502).json({ error: "Analysis service returned an invalid response." });
           return;
         }
         let servicePayload: unknown;
         try { servicePayload = JSON.parse(responseBody); } catch {
+          await pool.query(
+            `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = 'invalid_json', locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+            [complaintId]
+          );
           res.status(502).json({ error: "Analysis service returned an invalid response." });
           return;
         }
         if (!response.ok) {
           const detail = servicePayload && typeof servicePayload === "object" && "detail" in servicePayload ? servicePayload.detail : undefined;
           if (response.status === 503 && detail === "AI analysis is not configured on the server.") {
+            failureCode = "not_configured";
+            await pool.query(
+              `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = $2, locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+              [complaintId, failureCode]
+            );
             res.status(503).json({ error: "AI analysis is not configured. Set the selected provider's API key for the AI service." });
           } else if (response.status === 504) {
+            failureCode = "timeout";
+            await pool.query(
+              `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = $2, locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+              [complaintId, failureCode]
+            );
             res.status(504).json({ error: "Analysis timed out. You can retry manually." });
           } else {
+            failureCode = "service_unavailable";
+            await pool.query(
+              `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = $2, locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+              [complaintId, failureCode]
+            );
             res.status(502).json({ error: "Analysis service unavailable. You can retry analysis manually." });
           }
           return;
@@ -1009,10 +1056,19 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         analysis = servicePayload;
       } catch (error) {
         const timedOut = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+        failureCode = timedOut ? "timeout" : "service_unavailable";
+        await pool.query(
+          `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = $2, locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+          [complaintId, failureCode]
+        );
         res.status(timedOut ? 504 : 502).json({ error: timedOut ? "Analysis timed out. You can retry manually." : "Analysis service unavailable. You can retry manually." });
         return;
       }
       if (!validComplaintAnalysis(analysis)) {
+        await pool.query(
+          `UPDATE complaint_analysis_jobs SET status = 'failed', error_code = 'schema_validation_failed', locked_until = NULL, updated_at = now() WHERE complaint_id = $1`,
+          [complaintId]
+        );
         res.status(502).json({ error: "Analysis service returned an invalid response." });
         return;
       }
@@ -1033,6 +1089,12 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
           [complaintId, analysis.category, analysis.sentiment, analysis.severity, analysis.priority_score, analysis.priority_label,
             analysis.reasoning_summary, analysis.suggested_reply, analysis.model_name, analysis.analyzed_at]
         );
+        await client.query(
+          `INSERT INTO complaint_analysis_jobs(complaint_id, workspace_id, status, attempt_count, locked_until, error_code)
+           VALUES($1, $2, 'completed', 1, NULL, NULL)
+           ON CONFLICT(complaint_id) DO UPDATE SET status='completed', locked_until=NULL, error_code=NULL, updated_at=now()`,
+          [complaintId, String(req.params.workspaceId)]
+        );
         const user = res.locals.user as UserRow;
         const activity = await client.query<{ id: string }>(
           `INSERT INTO complaint_activity_events (complaint_id, workspace_id, event_type, actor_user_id, metadata)
@@ -1041,7 +1103,7 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         );
         await enqueueWebhookDeliveries(client, activity.rows[0].id, String(req.params.workspaceId));
         await client.query("COMMIT");
-        res.json({ analysis: saved.rows[0] });
+        res.json({ analysis: saved.rows[0], job: { status: "completed", error: null } });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;

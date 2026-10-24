@@ -28,6 +28,12 @@ type InboundRoute = { id: string; inboundAddress: string | null; enabled: boolea
 type InboundEvent = { status: string; error_code: string | null; attempt_count: number; next_attempt_at: string; received_at: string; processed_at: string | null; attachment_metadata: Array<{ filename: string; contentType: string; size: number; status: string }> };
 type MetaSocialConnection = { id: string; provider: "whatsapp" | "instagram"; provider_account_id: string; business_account_id: string | null; display_name: string; status: "pending" | "active" | "disconnected"; created_at: string; updated_at: string; last_successful_event_at: string | null; last_error_code: string | null; connected_at?: string | null; access_token_expires_at?: string | null; phone_display_number?: string | null; phone_verified_name?: string | null; authorized?: boolean };
 type WhatsAppConfiguration = { ready: boolean; missing: string[]; appId: string | null; loginConfigId: string | null; graphApiVersion: string };
+type StatusVariant = "ready" | "setup-required" | "not-configured" | "coming-soon" | "revoked";
+
+function StatusBadge({ label, variant }: { label: string; variant: StatusVariant }) {
+  return <span className={`integration-status-badge status-badge-${variant}`}>{label}</span>;
+}
+
 const supportedEvents = ["complaint_created", "status_changed", "analysis_completed"];
 const emptyDraft = { url: "", eventTypes: ["complaint_created"], enabled: true };
 let facebookSdkPromise: Promise<void> | null = null;
@@ -319,38 +325,77 @@ export function IntegrationsDashboard() {
       {secret && <section className="workspace-panel one-time-secret" aria-label="One-time secret"><div><strong>{secretKind}</strong><p>Store this securely. NomaanOS will not display it again.</p></div><code>{secret}</code><button className="filter-button" onClick={() => { void navigator.clipboard.writeText(secret).then(() => setNotice("Copied to clipboard. Clear the clipboard after storing the secret securely.")); }}>Copy secret</button><button className="text-button" onClick={() => setSecret("")}>Hide secret</button></section>}
       {workspaces.length === 0 ? <section className="workspace-panel"><p className="empty-state">Create a workspace from the <Link href="/dashboard">dashboard</Link> before configuring integrations.</p></section> : workspaceId && !loading && !error && <>
         <section className="workspace-panel integrations-settings"><div className="panel-head"><h2>Ingestion settings</h2><span>Workspace shared limit</span></div><form onSubmit={(event) => void saveSettings(event)}><label className="integration-check"><input type="checkbox" checked={settings.enabled} onChange={(event) => setSettings((current) => ({ ...current, enabled: event.target.checked }))} /> Allow API credential ingestion</label><label>Requests per minute<input type="number" min={1} max={600} value={settings.requests_per_minute} onChange={(event) => setSettings((current) => ({ ...current, requests_per_minute: Number(event.target.value) }))} /></label><button className="filter-button" disabled={saving}>Save settings</button></form><p>Only workspace owners and admins can change this limit. It is enforced in PostgreSQL across API processes.</p></section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><div className="contact-form-heading"><h2>Public contact form</h2><PublicContactFormHelp formUrl={contactForm?.enabled && !contactForm.revoked_at && generatedContactFormUrl?.workspaceId === workspaceId ? generatedContactFormUrl.url : undefined} /></div><span>{contactForm?.revoked_at ? "Revoked" : contactForm?.enabled ? "Enabled" : "Not configured"}</span></div><p>Hosted by NomaanOS. The public token maps to this workspace server-side. Never use a workspace API credential in browser code.</p>{contactForm ? <div className="integration-actions"><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form/rotate`, "POST", {}, "Public hosted form URL", (data) => `${contactFormBaseUrl}/${data.token}`)}>Rotate form link</button><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form`, "PATCH", { enabled: !contactForm.enabled })}>{contactForm.enabled ? "Disable" : "Enable"} form</button></div> : <button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form`, "POST", {}, "Public hosted form URL", (data) => `${contactFormBaseUrl}/${data.token}`)}>Create contact form link</button>}</section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>Embed &amp; Integrate Form</h2><span>Two ways to connect</span></div><p>Embed a ready-made complaint form, or connect a form on your site through your own secure backend.</p><Link className="filter-button" href={`/integrations/embed?workspaceId=${encodeURIComponent(workspaceId)}`}>Open setup wizard</Link></section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>WhatsApp and Instagram</h2><span>{metaConnections.filter((item) => item.status === "active").length} receiving events</span></div>
-          <p>Connect WhatsApp with Meta Embedded Signup. Instagram accounts continue to use manual account mapping. Meta access tokens are kept encrypted by the API and are never sent to the browser.</p>
-          <div className="integration-list"><div><strong>Meta webhook callback</strong><small>{metaCallbackUrl ?? "Set PUBLIC_API_BASE_URL to an externally reachable HTTPS API origin."}</small><small>App secret: {metaConfiguration.appSecretConfigured ? "configured" : "missing"} · Verify token: {metaConfiguration.verificationTokenConfigured ? "configured" : "missing"}</small></div></div>
-          <div className="whatsapp-signup">
-            <h3>WhatsApp Cloud API</h3>
-            <p>Meta opens its secure signup window. Choose your business and phone number to connect it to this workspace.</p>
-            {!whatsAppConfiguration.ready && <p className="meta-setup-warning">Embedded Signup is unavailable until the API administrator configures: {whatsAppConfiguration.missing.join(", ") || "the required Meta settings"}.</p>}
-            <button className="filter-button" disabled={saving || !whatsAppConfiguration.ready} onClick={() => void connectWhatsApp()}>
-              {saving ? "Connecting…" : metaConnections.some((item) => item.provider === "whatsapp" && item.status === "active") ? "Reconnect WhatsApp" : "Connect WhatsApp"}
-            </button>
+        <section className="workspace-panel integration-section"><div className="panel-head"><div className="contact-form-heading"><h2>Public contact form</h2><PublicContactFormHelp formUrl={contactForm?.enabled && !contactForm.revoked_at && generatedContactFormUrl?.workspaceId === workspaceId ? generatedContactFormUrl.url : undefined} /></div><StatusBadge label={contactForm?.revoked_at ? "Revoked" : contactForm?.enabled ? "Ready" : "Not configured"} variant={contactForm?.revoked_at ? "revoked" : contactForm?.enabled ? "ready" : "not-configured"} /></div><p>Hosted by NomaanOS. The public token maps to this workspace server-side. Never use a workspace API credential in browser code.</p>{contactForm ? <div className="integration-actions"><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form/rotate`, "POST", {}, "Public hosted form URL", (data) => `${contactFormBaseUrl}/${data.token}`)}>Rotate form link</button><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form`, "PATCH", { enabled: !contactForm.enabled })}>{contactForm.enabled ? "Disable" : "Enable"} form</button></div> : <button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/contact-form`, "POST", {}, "Public hosted form URL", (data) => `${contactFormBaseUrl}/${data.token}`)}>Create contact form link</button>}</section>
+        <section className="workspace-panel integration-section"><div className="panel-head"><h2>Embed &amp; Integrate Form</h2><StatusBadge label="Ready" variant="ready" /></div><p>Embed a ready-made complaint form, or connect a form on your site through your own secure backend.</p><Link className="filter-button" href={`/integrations/embed?workspaceId=${encodeURIComponent(workspaceId)}`}>Open setup wizard</Link></section>
+        <section className="workspace-panel integration-section">
+          <div className="panel-head">
+            <h2>WhatsApp and Instagram</h2>
+            <StatusBadge label="Coming Soon" variant="coming-soon" />
           </div>
-          <h3>Instagram professional account</h3>
-          <p>Configure an Instagram professional account ID after completing the applicable Meta app, account, permission, and webhook setup.</p>
-          <form className="integration-create-form" onSubmit={(event) => void saveMetaConnection(event)}>
-            <label>Instagram professional account ID<input value={metaDraft.providerAccountId} onChange={(event) => setMetaDraft((current) => ({ ...current, providerAccountId: event.target.value }))} required maxLength={200} /></label>
-            <label>Display name<input value={metaDraft.displayName} onChange={(event) => setMetaDraft((current) => ({ ...current, displayName: event.target.value }))} required maxLength={100} /></label>
-            <button className="filter-button" disabled={saving}>Configure Instagram account</button>
+          <div className="coming-soon-card">
+            <span className="coming-soon-pill">Feature in Development</span>
+            <h3>Omnichannel Messaging Integrations</h3>
+            <p>
+              Direct customer complaint ingestion via WhatsApp Cloud API and Instagram Direct Messaging is coming in an upcoming release. Automated message syncing, sentiment classification, and unified agent replies will be available soon.
+            </p>
+            <div className="coming-soon-tags">
+              <span>✦ WhatsApp Cloud API</span>
+              <span>✦ Instagram Direct Messages</span>
+              <span>✦ Verified Channel Webhooks</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="workspace-panel integration-section">
+          <div className="panel-head">
+            <h2>Inbound email</h2>
+            <StatusBadge label="Coming Soon" variant="coming-soon" />
+          </div>
+          <div className="coming-soon-card">
+            <span className="coming-soon-pill">Feature in Development</span>
+            <h3>Automated Email Ingestion</h3>
+            <p>
+              Forward incoming customer emails to a dedicated workspace address to automatically create and categorize complaints. Inbound routing and verified mailbox integrations are currently being finalized.
+            </p>
+            <div className="coming-soon-tags">
+              <span>✦ Dedicated Support Address</span>
+              <span>✦ Inbound MX Routing</span>
+              <span>✦ Attachment Metadata Extraction</span>
+            </div>
+          </div>
+        </section>
+
+        <section className="workspace-panel integration-section">
+          <div className="panel-head">
+            <h2>API credentials</h2>
+            <StatusBadge label={`${credentials.length} configured`} variant={credentials.length > 0 ? "ready" : "not-configured"} />
+          </div>
+          <form className="integration-create-form" onSubmit={(event) => void createCredential(event)}>
+            <label>Name<input value={name} onChange={(event) => setName(event.target.value)} required maxLength={100} placeholder="Website contact form" /></label>
+            <label>Expires on <small>Optional</small><input type="date" value={expires} min={new Date().toISOString().slice(0, 10)} onChange={(event) => setExpires(event.target.value)} /></label>
+            <button className="filter-button" disabled={saving}>Create credential</button>
           </form>
-          {metaConnections.length ? <ul className="integration-list">{metaConnections.map((item) => <li key={item.id}><div><strong>{item.display_name} · {item.provider}</strong><small>{item.provider === "whatsapp" && item.phone_display_number ? `${item.phone_display_number} · ` : ""}Account {item.provider_account_id}{item.business_account_id ? ` · Business ${item.business_account_id}` : ""} · {item.status}</small><small>{item.authorized && item.access_token_expires_at ? `Authorization expires ${new Date(item.access_token_expires_at).toLocaleString()} · ` : ""}{item.last_successful_event_at ? `Last signed message ${new Date(item.last_successful_event_at).toLocaleString()}` : "No accepted message event yet"}{item.last_error_code ? ` · Last error ${item.last_error_code}` : ""}</small></div>{item.status !== "disconnected" && <button className="filter-button danger-button" disabled={saving} onClick={() => void disconnectMeta(item)}>Disconnect</button>}</li>)}</ul> : <p className="empty-state">No Meta accounts configured for this workspace.</p>}
-        </section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>Inbound email</h2><span>{inboundStatus.replaceAll("_", " ")}</span></div><p>Messages are routed using a random per-workspace address. Resend’s account webhook and inbound domain still require setup.</p>{inboundRoute ? <><p className="inbound-address"><strong>Address:</strong> <code>{inboundRoute.inboundAddress ?? "Unavailable: check API encryption configuration"}</code></p><div className="integration-actions"><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/inbound-email/rotate`, "POST", {}, "Replacement inbound address", (data) => data.route?.inboundAddress ?? "")}>Rotate address</button><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/inbound-email`, "PATCH", { enabled: !inboundRoute.enabled })}>{inboundRoute.enabled ? "Disable" : "Enable"} inbound route</button></div></> : <button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/inbound-email`, "POST", {}, "Inbound address", (data) => data.route?.inboundAddress ?? "")}>Create inbound address</button>}
-          {inboundEvents.length ? <ul className="integration-list inbound-events-list">{inboundEvents.map((item, index) => <li key={`${item.received_at}-${index}`}><div><strong>{item.status}{item.error_code ? ` · ${item.error_code}` : ""}</strong><small>Received {new Date(item.received_at).toLocaleString()} · {item.attempt_count} attempts</small>{item.attachment_metadata.length > 0 && <small>Attachments: {item.attachment_metadata.map((file) => `${file.filename} (${file.status}, ${file.size} bytes)`).join(", ")}</small>}</div></li>)}</ul> : <p className="empty-state">No inbound email events received.</p>}
-        </section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>API credentials</h2><span>{credentials.length} total</span></div><form className="integration-create-form" onSubmit={(event) => void createCredential(event)}><label>Name<input value={name} onChange={(event) => setName(event.target.value)} required maxLength={100} placeholder="Website contact form" /></label><label>Expires on <small>Optional</small><input type="date" value={expires} min={new Date().toISOString().slice(0, 10)} onChange={(event) => setExpires(event.target.value)} /></label><button className="filter-button" disabled={saving}>Create credential</button></form>
           {credentials.length ? <ul className="integration-list">{credentials.map((item) => <li key={item.id}><div><strong>{item.name}</strong><small>Prefix <code>{item.key_prefix}</code> · Created {new Date(item.created_at).toLocaleString()}</small><small>{item.last_used_at ? `Last used ${new Date(item.last_used_at).toLocaleString()}` : "Never used"}{item.expires_at ? ` · Expires ${new Date(item.expires_at).toLocaleDateString()}` : " · No expiry"}{item.revoked_at ? ` · Revoked ${new Date(item.revoked_at).toLocaleString()}` : ""}</small></div>{!item.revoked_at && <div className="integration-actions"><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/credentials/${item.id}/rotate`, "POST", {}, "Replacement API credential")}>Rotate</button><button className="filter-button danger-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/credentials/${item.id}/revoke`, "POST", {})}>Revoke</button></div>}</li>)}</ul> : <p className="empty-state">No API credentials yet.</p>}
         </section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>Webhook endpoints</h2><span>{webhooks.length} active configurations</span></div><form className="webhook-create-form" onSubmit={(event) => void createWebhook(event)}><label>HTTPS endpoint URL<input type="url" value={draft.url} onChange={(event) => setDraft((current) => ({ ...current, url: event.target.value }))} required maxLength={2048} placeholder="https://business.example/hooks/nomaanos" /></label><EventChoices values={draft.eventTypes} onChange={(eventTypes) => setDraft((current) => ({ ...current, eventTypes }))} /><button className="filter-button" disabled={saving}>Create webhook</button></form>
-          {webhooks.length ? <ul className="integration-list webhook-list">{webhooks.map((item) => { const edit = webhookDrafts[item.id] ?? { url: item.url, eventTypes: item.event_types, enabled: item.enabled }; return <li key={item.id}><div className="webhook-edit"><strong>{item.url}</strong><label>Endpoint URL<input type="url" value={edit.url} onChange={(event) => setWebhookDrafts((current) => ({ ...current, [item.id]: { ...edit, url: event.target.value } }))} /></label><EventChoices values={edit.eventTypes} onChange={(eventTypes) => setWebhookDrafts((current) => ({ ...current, [item.id]: { ...edit, eventTypes } }))} /><label className="integration-check"><input type="checkbox" checked={edit.enabled} onChange={(event) => setWebhookDrafts((current) => ({ ...current, [item.id]: { ...edit, enabled: event.target.checked } }))} /> Enabled</label><small>Subscribed events: {item.event_types.join(", ")} · Created {new Date(item.created_at).toLocaleString()}</small></div><div className="integration-actions"><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/webhooks/${item.id}`, "PATCH", { ...edit })}>Save</button><button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/webhooks/${item.id}/rotate-secret`, "POST", {}, "Replacement webhook signing secret")}>Rotate secret</button><button className="filter-button danger-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/webhooks/${item.id}`, "DELETE")}>Delete</button></div></li>; })}</ul> : <p className="empty-state">No webhook endpoints configured yet.</p>}
+
+        <section className="workspace-panel integration-section">
+          <div className="panel-head">
+            <h2>Webhook endpoints</h2>
+            <StatusBadge label="Coming Soon" variant="coming-soon" />
+          </div>
+          <div className="coming-soon-card">
+            <span className="coming-soon-pill">Feature in Development</span>
+            <h3>Outbound Event Webhooks</h3>
+            <p>
+              Subscribe your external backend and systems to real-time complaint lifecycle events, classification updates, and SLA alerts. Webhook subscriptions and delivery logging will be available in an upcoming release.
+            </p>
+            <div className="coming-soon-tags">
+              <span>✦ Real-Time Event Dispatch</span>
+              <span>✦ HMAC-SHA256 Signatures</span>
+              <span>✦ Automated Retries &amp; Deliveries</span>
+            </div>
+          </div>
         </section>
-        <section className="workspace-panel integration-section"><div className="panel-head"><h2>Recent deliveries</h2><span>Latest {deliveries.length}</span></div>{deliveries.length ? <ul className="integration-list delivery-list">{deliveries.map((item) => <li key={item.id}><div><strong>{item.state} · {item.last_http_status ? `HTTP ${item.last_http_status}` : "No HTTP response"}</strong><small>{item.url}</small><small>Event {item.event_id} · {item.total_attempt_count} attempts · {item.attempt_history_count} log entries</small><small>{item.last_result ?? (item.state === "pending" ? `Next attempt ${new Date(item.next_attempt_at).toLocaleString()}` : "No delivery result")}</small></div>{item.state === "failed" && <button className="filter-button" disabled={saving} onClick={() => void action(`/workspaces/${workspaceId}/integrations/deliveries/${item.id}/retry`, "POST")}>Retry</button>}</li>)}</ul> : <p className="empty-state">No webhook deliveries yet.</p>}</section>
       </>}
     </section>}
   </main>;
