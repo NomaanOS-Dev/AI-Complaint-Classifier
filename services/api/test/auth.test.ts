@@ -17,7 +17,7 @@ if (!existsSync("/.dockerenv") && process.env.DATABASE_URL) {
   const localTestUrl = new URL(process.env.DATABASE_URL);
   if (localTestUrl.hostname === "db") {
     localTestUrl.hostname = "127.0.0.1";
-    localTestUrl.port = process.env.POSTGRES_PORT ?? "5433";
+    localTestUrl.port = process.env.POSTGRES_PORT ?? "5435";
     process.env.DATABASE_URL = localTestUrl.toString();
   }
 }

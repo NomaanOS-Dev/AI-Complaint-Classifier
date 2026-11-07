@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-nomaanos}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-local-password}
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "${POSTGRES_PORT:-5435}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -14,6 +14,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    networks:
+      - default
 
   api:
     build:
@@ -49,6 +51,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    networks:
+      - default
 
   ai:
     build:
@@ -72,6 +76,8 @@ services:
       interval: 10s
       timeout: 3s
       retries: 5
+    networks:
+      - default
 
   web:
     build:
@@ -88,6 +94,12 @@ services:
         condition: service_healthy
       ai:
         condition: service_healthy
+    networks:
+      - default
 
 volumes:
   postgres_data:
+
+networks:
+  default:
+    name: 5-ai-complaints-classifications_default
