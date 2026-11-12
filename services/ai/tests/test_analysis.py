@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 import httpx
 from google.genai import errors as genai_errors
 from openai import APIConnectionError, APIStatusError, APITimeoutError
@@ -20,6 +21,7 @@ from app.main import (
     Sentiment,
     Severity,
     analyze_complaint,
+    app,
     get_gemini_client,
     get_ollama_timeout,
     get_openai_client as create_openai_client,
@@ -456,6 +458,86 @@ class AnalysisFallbackAndOllamaTests(unittest.IsolatedAsyncioTestCase):
                 await analyze_complaint(AnalysisRequest(title="Issue", description="Details"))
             self.assertEqual(caught.exception.status_code, 503)
             self.assertIn("not configured", caught.exception.detail)
+
+
+class AnalysisAuthAndProviderSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.http_client = TestClient(app)
+        self.gemini_client = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=AsyncMock())))
+        self.gemini_client.aio.models.generate_content.return_value = SimpleNamespace(text=json.dumps(output_payload()))
+
+    def test_health_is_accessible_without_internal_token(self):
+        with patch.dict(os.environ, {"AI_SERVICE_SECRET": "test-internal-secret"}, clear=False):
+            response = self.http_client.get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok", "service": "ai"})
+
+    def test_analyze_requires_configured_secret_and_valid_token(self):
+        payload = {"title": "Payment deducted", "description": "Order remained pending."}
+        with patch.dict(os.environ, {"AI_SERVICE_SECRET": ""}, clear=False):
+            missing_secret = self.http_client.post("/analyze", json=payload)
+        self.assertEqual(missing_secret.status_code, 503)
+
+        with patch.dict(os.environ, {
+            "AI_SERVICE_SECRET": "test-internal-secret",
+            "AI_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "fake-gemini-key",
+        }, clear=False):
+            missing_token = self.http_client.post("/analyze", json=payload)
+            self.assertEqual(missing_token.status_code, 401)
+
+            wrong_token = self.http_client.post(
+                "/analyze",
+                json=payload,
+                headers={"x-ai-service-token": "wrong-secret"},
+            )
+            self.assertEqual(wrong_token.status_code, 401)
+
+            with patch("app.main.get_gemini_client", return_value=self.gemini_client):
+                valid_token = self.http_client.post(
+                    "/analyze",
+                    json=payload,
+                    headers={"x-ai-service-token": "test-internal-secret"},
+                )
+            self.assertEqual(valid_token.status_code, 200)
+            self.assertEqual(valid_token.json()["category"], "payment")
+
+    def test_explicit_gemini_provider_does_not_silently_fallback_to_other_providers(self):
+        self.gemini_client.aio.models.generate_content.side_effect = genai_errors.APIError(403, {"message": "forbidden"})
+        openai_client = SimpleNamespace(responses=SimpleNamespace(create=AsyncMock()))
+        with patch.dict(os.environ, {
+            "AI_SERVICE_SECRET": "test-internal-secret",
+            "AI_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "fake-gemini-key",
+            "OPENAI_API_KEY": "fake-openai-key",
+            "OLLAMA_BASE_URL": "http://localhost:11434",
+        }, clear=False):
+            with patch("app.main.get_gemini_client", return_value=self.gemini_client), \
+                 patch("app.main.get_openai_client", return_value=openai_client), \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as ollama_post:
+                response = self.http_client.post(
+                    "/analyze",
+                    json={"title": "Issue", "description": "Details"},
+                    headers={"x-ai-service-token": "test-internal-secret"},
+                )
+        self.assertEqual(response.status_code, 502)
+        openai_client.responses.create.assert_not_awaited()
+        ollama_post.assert_not_awaited()
+
+    def test_empty_gemini_response_returns_502(self):
+        self.gemini_client.aio.models.generate_content.return_value = SimpleNamespace(text="")
+        with patch.dict(os.environ, {
+            "AI_SERVICE_SECRET": "test-internal-secret",
+            "AI_PROVIDER": "gemini",
+            "GEMINI_API_KEY": "fake-gemini-key",
+        }, clear=False):
+            with patch("app.main.get_gemini_client", return_value=self.gemini_client):
+                response = self.http_client.post(
+                    "/analyze",
+                    json={"title": "Issue", "description": "Details"},
+                    headers={"x-ai-service-token": "test-internal-secret"},
+                )
+        self.assertEqual(response.status_code, 502)
 
 
 if __name__ == "__main__":

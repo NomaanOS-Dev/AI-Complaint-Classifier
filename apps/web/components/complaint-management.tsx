@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { FormEvent, useEffect, useState } from "react";
 import { apiErrorMessage, apiRequest } from "../lib/api";
+import { TwoLayerNavbar } from "./brand-logo";
 
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
 type Complaint = {
@@ -45,9 +46,10 @@ export function ComplaintManagement() {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    apiRequest<{ user: { id: string } }>("/auth/me").then(async (me) => {
+    apiRequest<{ user: { id: string; email_verified?: boolean } }>("/auth/me").then(async (me) => {
       if (me.response.status === 401) { router.replace("/login"); return; }
       if (!me.response.ok) throw new Error("Could not load your account.");
+      if (me.data.user && me.data.user.email_verified === false) { router.replace("/verify-email"); return; }
       const result = await apiRequest<{ workspaces: Workspace[] }>("/workspaces");
       if (!result.response.ok) throw new Error(apiErrorMessage(result.data, "Could not load workspaces."));
       setWorkspaces(result.data.workspaces);
@@ -124,7 +126,13 @@ export function ComplaintManagement() {
 
   const activeWorkspace = workspaces.find((item) => item.id === workspaceId);
   return <main className="dashboard-shell complaints-shell">
-    <nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><div className="complaint-nav"><Link className="text-button" href="/dashboard">Dashboard</Link><button className="text-button" onClick={async () => { await apiRequest("/auth/logout", { method: "POST", body: "{}" }); router.replace("/login"); }}>Log out</button></div></nav>
+    <TwoLayerNavbar>
+      <Link className="text-button" href="/dashboard">Dashboard</Link>
+      <Link className="text-button" href={workspaceId ? `/analytics?workspaceId=${workspaceId}` : "/analytics"}>Analytics</Link>
+      <Link className="text-button" href={workspaceId ? `/billing?workspaceId=${workspaceId}` : "/billing"}>Billing</Link>
+      <Link className="text-button" href="/pricing">Pricing</Link>
+      <button className="text-button" onClick={async () => { await apiRequest("/auth/logout", { method: "POST", body: "{}" }); router.replace("/login"); }}>Log out</button>
+    </TwoLayerNavbar>
     {busy ? <p className="loading-state">Loading your complaints…</p> : <section className="dashboard-content">
       <p className="eyebrow">COMPLAINT WORKSPACE</p><h1>Complaints</h1><p className="dashboard-intro">Capture and track customer issues for a workspace you belong to.</p>
       {error && <p className="form-error" role="alert">{error}</p>}

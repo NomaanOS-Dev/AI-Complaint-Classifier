@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { apiErrorMessage, apiRequest } from "../lib/api";
 import { parseWhatsAppSignupMessage, type WhatsAppSignupAssets } from "../lib/meta-whatsapp-signup";
 import { PublicContactFormHelp } from "./public-contact-form-help";
+import { TwoLayerNavbar } from "./brand-logo";
 
 declare global {
   interface Window {
@@ -316,7 +317,13 @@ export function IntegrationsDashboard() {
   async function logout() { await apiRequest("/auth/logout", { method: "POST", body: "{}" }); router.replace("/login"); }
 
   return <main className="dashboard-shell integrations-shell">
-    <nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><div className="complaint-nav"><Link className="text-button" href="/dashboard">Dashboard</Link><Link className="text-button" href="/analytics">Analytics</Link><Link className="text-button" href="/complaints">Complaints</Link><button className="text-button" onClick={() => void logout()}>Log out</button></div></nav>
+    <TwoLayerNavbar>
+      <Link className="text-button" href="/dashboard">Dashboard</Link>
+      <Link className="text-button" href="/analytics">Analytics</Link>
+      <Link className="text-button" href="/complaints">Complaints</Link>
+      <Link className="text-button" href="/billing">Billing</Link>
+      <button className="text-button" onClick={() => void logout()}>Log out</button>
+    </TwoLayerNavbar>
     {busy ? <p className="loading-state">Loading integration settings…</p> : <section className="dashboard-content">
       <p className="eyebrow">INTEGRATION SETTINGS</p><h1>Connect your systems</h1><p className="dashboard-intro">Manage workspace API credentials, event subscriptions, and delivery history.</p>
       {workspaces.length > 0 && <div className="complaint-toolbar"><label>Workspace<select value={workspaceId} onChange={(event) => { setWorkspaceId(event.target.value); setSecret(""); setGeneratedContactFormUrl(null); setNotice(""); }}><option value="" disabled>Select workspace</option>{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.role}</option>)}</select></label><button className="filter-button" disabled={loading} onClick={() => void refresh()}>{loading ? "Refreshing…" : "Refresh"}</button></div>}

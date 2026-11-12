@@ -44,11 +44,15 @@ export async function requestComplaintAnalysis(
   const configuredTimeout = Number(process.env.AI_SERVICE_TIMEOUT_MS ?? 30000);
   const timeoutMs = Number.isInteger(configuredTimeout) && configuredTimeout >= 100 && configuredTimeout <= 30000 ? configuredTimeout : 30000;
   const serviceUrl = process.env.AI_SERVICE_URL ?? "http://localhost:8001";
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (process.env.AI_SERVICE_SECRET) {
+    headers["x-ai-service-token"] = process.env.AI_SERVICE_SECRET;
+  }
   let response: Response;
   try {
     response = await fetcher(`${serviceUrl.replace(/\/$/, "")}/analyze`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({ title: complaint.title, description: complaint.description }),
       signal: AbortSignal.timeout(timeoutMs)
     });

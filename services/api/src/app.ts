@@ -10,11 +10,42 @@ import { mountDay8Routes } from "./day8-routes.js";
 import { mountMetaSocialRoutes, mountMetaWebhook } from "./meta-social.js";
 import { createWhatsAppGraphApi, mountWhatsAppSignupRoutes, type WhatsAppGraphApi } from "./meta-whatsapp.js";
 import { mountResendWebhook } from "./resend-webhook.js";
+import { mountBillingRoutes, mountRazorpayWebhook } from "./billing-routes.js";
+import { reserveComplaintUsage } from "./billing-service.js";
+import { createRazorpayGateway, type RazorpayGateway } from "./razorpay-client.js";
 import {
   encryptWebhookSecret, generateIntegrationCredential, hashIntegrationCredential,
   hasIntegrationEncryptionKey, integrationEventTypes, isValidCredentialFormat, resolveSafeWebhookUrl
 } from "./integration-security.js";
 import { enqueueComplaintAnalysis, persistComplaintAnalysis } from "./complaint-analysis-worker.js";
+import {
+  createPasswordResetToken,
+  createVerificationToken,
+  sendPasswordResetEmail,
+  sendVerificationEmail,
+  type VerificationEmailClient,
+  verifyEmailToken
+} from "./email-service.js";
+import {
+  exchangeGoogleAuthorizationCode,
+  generatePkce,
+  getGoogleAuthorizationUrl,
+  type GoogleUserProfile,
+  isGoogleOAuthConfigured,
+  verifyGoogleIdToken
+} from "./google-auth.js";
+
+declare module "express-session" {
+  interface SessionData {
+    userId?: string;
+    csrfToken?: string;
+    googleOAuth?: {
+      state: string;
+      verifier?: string;
+      createdAt: number;
+    };
+  }
+}
 
 const PgSessionStore = connectPgSimple(session);
 const SESSION_COOKIE = "nomaanos.sid";
@@ -22,7 +53,13 @@ const SESSION_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const dummyPasswordHash = argon2.hash(randomBytes(32).toString("hex"), { type: argon2.argon2id });
 
-type UserRow = { id: string; name: string; email: string };
+type UserRow = {
+  id: string;
+  name: string;
+  email: string;
+  email_verified: boolean;
+  google_id?: string | null;
+};
 type WorkspaceRow = { id: string; name: string; role?: "owner" | "admin" | "member"; created_at?: string };
 type ComplaintRow = {
   id: string; workspace_id: string; title: string; description: string; customer_email: string | null;
@@ -141,7 +178,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     res.status(401).json({ error: "Authentication required" });
     return;
   }
-  void pool.query<UserRow>("SELECT id, name, email FROM users WHERE id = $1", [userId]).then(({ rows }) => {
+  void pool.query<UserRow>("SELECT id, name, email, email_verified, google_id FROM users WHERE id = $1", [userId]).then(({ rows }) => {
     if (!rows[0]) {
       req.session.destroy(() => undefined);
       res.status(401).json({ error: "Authentication required" });
@@ -152,9 +189,22 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
   }).catch(next);
 }
 
+function requireVerified(req: Request, res: Response, next: NextFunction) {
+  const user = res.locals.user as UserRow;
+  if (!user.email_verified) {
+    res.status(403).json({ error: "Email verification required before accessing workspace resources.", code: "EMAIL_NOT_VERIFIED" });
+    return;
+  }
+  next();
+}
+
 function requireWorkspaceRole(allowedRoles: Array<"owner" | "admin" | "member">) {
   return asyncRoute(async (req, res, next) => {
     const user = res.locals.user as UserRow;
+    if (!user.email_verified) {
+      res.status(403).json({ error: "Email verification required before accessing workspace resources.", code: "EMAIL_NOT_VERIFIED" });
+      return;
+    }
     const workspaceId = String(req.params.workspaceId);
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(workspaceId)) {
       res.status(404).json({ error: "Workspace not found" });
@@ -178,15 +228,22 @@ function requireWorkspaceRole(allowedRoles: Array<"owner" | "admin" | "member">)
   });
 }
 
-export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGraphApi?: WhatsAppGraphApi } = {}) {
+export function createApp(options: {
+  metaGraphFetch?: typeof fetch;
+  whatsappGraphApi?: WhatsAppGraphApi;
+  emailResendClient?: VerificationEmailClient;
+  razorpayGateway?: RazorpayGateway;
+} = {}) {
   const sessionSecret = process.env.SESSION_SECRET;
   if (!sessionSecret || Buffer.byteLength(sessionSecret) < 32) {
     throw new Error("SESSION_SECRET must be configured with at least 32 bytes");
   }
 
+  const razorpayGateway = options.razorpayGateway ?? createRazorpayGateway();
   const app = express();
   mountResendWebhook(app);
   mountMetaWebhook(app, enqueueWebhookDeliveries);
+  mountRazorpayWebhook(app, pool, razorpayGateway);
   const isProduction = process.env.NODE_ENV === "production";
   const origin = process.env.WEB_ORIGIN ?? "http://localhost:3000";
   const authLimiter = rateLimit({
@@ -195,6 +252,20 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     standardHeaders: "draft-8",
     legacyHeaders: false,
     message: { error: "Too many authentication attempts. Try again later." }
+  });
+  const forgotPasswordLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 5,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many password reset requests. Try again later." }
+  });
+  const resetPasswordLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    standardHeaders: "draft-8",
+    legacyHeaders: false,
+    message: { error: "Too many password reset attempts. Try again later." }
   });
 
   if (isProduction) app.set("trust proxy", 1);
@@ -251,10 +322,11 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     const client = await pool.connect();
     let user: UserRow;
     let workspace: WorkspaceRow;
+    let rawVerificationToken: string | undefined;
     try {
       await client.query("BEGIN");
       const userResult = await client.query<UserRow>(
-        "INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email",
+        "INSERT INTO users (name, email, password_hash, email_verified) VALUES ($1, $2, $3, false) RETURNING id, name, email, email_verified",
         [name.trim(), normalizedEmail, passwordHash]
       );
       user = userResult.rows[0];
@@ -264,6 +336,9 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       );
       workspace = workspaceResult.rows[0];
       await client.query("INSERT INTO tenant_memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')", [workspace.id, user.id]);
+
+      const tokenResult = await createVerificationToken(client, user.id);
+      rawVerificationToken = tokenResult.rawToken;
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -276,22 +351,40 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       client.release();
     }
 
+    if (rawVerificationToken) {
+      void sendVerificationEmail({
+        to: user.email,
+        name: user.name,
+        rawToken: rawVerificationToken,
+        resendClient: options.emailResendClient
+      }).catch((err) => console.error("[Auth] Failed to dispatch verification email:", err));
+    }
+
     await regenerateSession(req);
     req.session.userId = user.id;
     req.session.csrfToken = randomBytes(32).toString("hex");
     await saveSession(req);
-    res.status(201).json({ user, workspace: { ...workspace, role: "owner" }, csrfToken: req.session.csrfToken });
+    res.status(201).json({
+      user,
+      workspace: { ...workspace, role: "owner" },
+      verificationRequired: true,
+      message: "Registration successful. Please check your email to verify your account.",
+      csrfToken: req.session.csrfToken
+    });
   }));
 
   app.post("/auth/login", authLimiter, csrfProtection, asyncRoute(async (req, res) => {
     const { email, password } = req.body ?? {};
     const normalizedEmail = typeof email === "string" ? normalizeEmail(email) : "";
     const userResult = emailPattern.test(normalizedEmail)
-      ? await pool.query<{ id: string; name: string; email: string; password_hash: string }>("SELECT id, name, email, password_hash FROM users WHERE email = $1", [normalizedEmail])
-      : { rows: [] as Array<{ id: string; name: string; email: string; password_hash: string }> };
+      ? await pool.query<{ id: string; name: string; email: string; email_verified: boolean; password_hash: string | null }>(
+          "SELECT id, name, email, email_verified, password_hash FROM users WHERE email = $1",
+          [normalizedEmail]
+        )
+      : { rows: [] as Array<{ id: string; name: string; email: string; email_verified: boolean; password_hash: string | null }> };
     const user = userResult.rows[0];
     const verificationHash = user?.password_hash ?? await dummyPasswordHash;
-    const validPassword = typeof password === "string"
+    const validPassword = typeof password === "string" && Boolean(user?.password_hash)
       ? await argon2.verify(verificationHash, password).catch(() => false)
       : false;
     if (!user || !validPassword) {
@@ -303,7 +396,432 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     req.session.userId = user.id;
     req.session.csrfToken = randomBytes(32).toString("hex");
     await saveSession(req);
-    res.json({ user: { id: user.id, name: user.name, email: user.email }, csrfToken: req.session.csrfToken });
+    res.json({
+      user: { id: user.id, name: user.name, email: user.email, email_verified: user.email_verified },
+      verificationRequired: !user.email_verified,
+      csrfToken: req.session.csrfToken
+    });
+  }));
+
+  app.post("/auth/verify-email", authLimiter, asyncRoute(async (req, res) => {
+    const { token } = req.body ?? {};
+    if (typeof token !== "string" || !token.trim()) {
+      res.status(400).json({ error: "A verification token is required." });
+      return;
+    }
+
+    const result = await verifyEmailToken(pool, token);
+    if (!result.success || !result.user) {
+      res.status(400).json({ error: "The verification link is invalid, expired, or has already been used." });
+      return;
+    }
+
+    if (req.session.userId === result.user.id) {
+      res.locals.user = result.user;
+    }
+
+    res.json({
+      success: true,
+      message: "Email address verified successfully. You can now access your dashboard.",
+      user: result.user
+    });
+  }));
+
+  app.post("/auth/resend-verification", authLimiter, csrfProtection, asyncRoute(async (req, res) => {
+    let targetUser: UserRow | undefined;
+    const sessionUserId = req.session.userId;
+    if (sessionUserId) {
+      const userRes = await pool.query<UserRow>(
+        "SELECT id, name, email, email_verified FROM users WHERE id = $1",
+        [sessionUserId]
+      );
+      targetUser = userRes.rows[0];
+    } else if (req.body?.email && typeof req.body.email === "string") {
+      const normalizedEmail = normalizeEmail(req.body.email);
+      if (emailPattern.test(normalizedEmail)) {
+        const userRes = await pool.query<UserRow>(
+          "SELECT id, name, email, email_verified FROM users WHERE email = $1",
+          [normalizedEmail]
+        );
+        targetUser = userRes.rows[0];
+      }
+    }
+
+    if (!targetUser) {
+      // Generic message to avoid email enumeration
+      res.json({
+        message: "If an account exists with this email and is pending verification, a verification link has been sent."
+      });
+      return;
+    }
+
+    if (targetUser.email_verified) {
+      res.json({ message: "This email address is already verified. You may sign in." });
+      return;
+    }
+
+    const recentToken = await pool.query(
+      "SELECT id FROM email_verification_tokens WHERE user_id = $1 AND created_at > now() - interval '60 seconds'",
+      [targetUser.id]
+    );
+    if (recentToken.rowCount) {
+      res.status(429).json({ error: "Please wait at least 60 seconds before requesting another verification email." });
+      return;
+    }
+
+    const { rawToken } = await createVerificationToken(pool, targetUser.id);
+    void sendVerificationEmail({
+      to: targetUser.email,
+      name: targetUser.name,
+      rawToken,
+      resendClient: options.emailResendClient
+    }).catch((err) => console.error("[Auth] Resend verification email failed:", err));
+
+    res.json({ message: "A new verification link has been sent to your email address." });
+  }));
+
+  app.post("/auth/change-email", authLimiter, csrfProtection, requireAuth, asyncRoute(async (req, res) => {
+    const user = res.locals.user as UserRow;
+    if (user.email_verified) {
+      res.status(400).json({ error: "Email address is already verified." });
+      return;
+    }
+
+    const { newEmail } = req.body ?? {};
+    const normalizedEmail = typeof newEmail === "string" ? normalizeEmail(newEmail) : "";
+    if (!emailPattern.test(normalizedEmail) || normalizedEmail.length > 254) {
+      res.status(400).json({ error: "Please enter a valid email address." });
+      return;
+    }
+
+    if (normalizedEmail === user.email) {
+      res.status(400).json({ error: "New email must be different from current email." });
+      return;
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query("SELECT id FROM users WHERE email = $1", [normalizedEmail]);
+      if (existing.rowCount) {
+        await client.query("ROLLBACK");
+        res.status(409).json({ error: "An account already exists for that email." });
+        return;
+      }
+
+      await client.query("UPDATE users SET email = $1, updated_at = now() WHERE id = $2", [normalizedEmail, user.id]);
+      const { rawToken } = await createVerificationToken(client, user.id);
+      await client.query("COMMIT");
+
+      void sendVerificationEmail({
+        to: normalizedEmail,
+        name: user.name,
+        rawToken,
+        resendClient: options.emailResendClient
+      }).catch((err) => console.error("[Auth] Change email verification dispatch failed:", err));
+
+      res.json({
+        message: "Email updated successfully. A verification link has been sent to your new email.",
+        email: normalizedEmail
+      });
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }));
+
+  app.post("/auth/forgot-password", forgotPasswordLimiter, csrfProtection, asyncRoute(async (req, res) => {
+    const { email } = req.body ?? {};
+    const normalizedEmail = typeof email === "string" ? normalizeEmail(email) : "";
+    if (!emailPattern.test(normalizedEmail) || normalizedEmail.length > 254) {
+      res.status(400).json({ error: "Please enter a valid email address." });
+      return;
+    }
+
+    const genericMessage = "If an account exists for that email address, we have sent password reset instructions.";
+    const userResult = await pool.query<{ id: string; name: string; email: string; password_hash: string | null }>(
+      "SELECT id, name, email, password_hash FROM users WHERE email = $1",
+      [normalizedEmail]
+    );
+    const user = userResult.rows[0];
+
+    // Do not reveal account existence or allow Google-only accounts (password_hash IS NULL) to set a local password.
+    if (!user || !user.password_hash) {
+      res.json({ message: genericMessage });
+      return;
+    }
+
+    const client = await pool.connect();
+    let rawToken: string;
+    try {
+      await client.query("BEGIN");
+      const tokenResult = await createPasswordResetToken(client, user.id);
+      rawToken = tokenResult.rawToken;
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    await sendPasswordResetEmail({
+      to: user.email,
+      name: user.name,
+      rawToken,
+      resendClient: options.emailResendClient
+    });
+
+    res.json({ message: genericMessage });
+  }));
+
+  app.post("/auth/reset-password", resetPasswordLimiter, csrfProtection, asyncRoute(async (req, res) => {
+    const { token, password, confirmPassword } = req.body ?? {};
+    if (typeof token !== "string" || token.trim().length < 16 || token.trim().length > 256) {
+      res.status(400).json({ error: "This password reset link is invalid. Please request a new one." });
+      return;
+    }
+    if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+      res.status(400).json({ error: "Password must be between 12 and 128 characters." });
+      return;
+    }
+    if (confirmPassword !== undefined && confirmPassword !== password) {
+      res.status(400).json({ error: "Passwords do not match." });
+      return;
+    }
+
+    const tokenHash = createHash("sha256").update(token.trim()).digest("hex");
+    const newPasswordHash = await argon2.hash(password, { type: argon2.argon2id });
+
+    const client = await pool.connect();
+    let resetUserId: string | undefined;
+    try {
+      await client.query("BEGIN");
+      const tokenLookup = await client.query<{
+        token_id: string;
+        user_id: string;
+        expires_at: Date;
+        used_at: Date | null;
+        password_hash: string | null;
+      }>(
+        `SELECT prt.id AS token_id, prt.user_id, prt.expires_at, prt.used_at, u.password_hash
+         FROM password_reset_tokens prt
+         JOIN users u ON u.id = prt.user_id
+         WHERE prt.token_hash = $1
+         FOR UPDATE`,
+        [tokenHash]
+      );
+
+      const record = tokenLookup.rows[0];
+      if (!record) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: "This password reset link is invalid. Please request a new one." });
+        return;
+      }
+      if (record.used_at !== null) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: "This password reset link has already been used. Please request a new one." });
+        return;
+      }
+      if (new Date(record.expires_at).getTime() <= Date.now()) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: "This password reset link has expired. Please request a new one." });
+        return;
+      }
+      if (!record.password_hash) {
+        await client.query("ROLLBACK");
+        res.status(400).json({ error: "Password reset is not available for Google-only accounts. Please sign in with Google." });
+        return;
+      }
+
+      await client.query(
+        "UPDATE password_reset_tokens SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+        [record.user_id]
+      );
+      await client.query(
+        "UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2",
+        [newPasswordHash, record.user_id]
+      );
+      await client.query(
+        "DELETE FROM user_sessions WHERE sess ->> 'userId' = $1",
+        [record.user_id]
+      );
+
+      await client.query("COMMIT");
+      resetUserId = record.user_id;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    if (resetUserId && req.session.userId === resetUserId) {
+      await regenerateSession(req);
+      req.session.csrfToken = randomBytes(32).toString("hex");
+      await saveSession(req);
+    }
+
+    res.json({
+      success: true,
+      message: "Your password has been reset successfully. You can now sign in with your new password."
+    });
+  }));
+
+  // Google OAuth 2.0 endpoints
+  async function handleGoogleLogin(profile: GoogleUserProfile): Promise<UserRow> {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      // 1. Existing user by Google ID
+      const byGoogleId = await client.query<UserRow>(
+        "SELECT id, name, email, email_verified, google_id FROM users WHERE google_id = $1",
+        [profile.googleId]
+      );
+      if (byGoogleId.rows[0]) {
+        const u = byGoogleId.rows[0];
+        if (!u.email_verified) {
+          await client.query(
+            "UPDATE users SET email_verified = true, email_verified_at = now(), updated_at = now() WHERE id = $1",
+            [u.id]
+          );
+        }
+        await client.query("COMMIT");
+        return { ...u, email_verified: true };
+      }
+
+      // 2. Existing user by email (secure account linking since Google verified email)
+      const byEmail = await client.query<UserRow>(
+        "SELECT id, name, email, email_verified, google_id FROM users WHERE email = $1",
+        [profile.email]
+      );
+      if (byEmail.rows[0]) {
+        const u = byEmail.rows[0];
+        await client.query(
+          "UPDATE users SET google_id = $1, email_verified = true, email_verified_at = COALESCE(email_verified_at, now()), updated_at = now() WHERE id = $2",
+          [profile.googleId, u.id]
+        );
+        await client.query("COMMIT");
+        return { ...u, google_id: profile.googleId, email_verified: true };
+      }
+
+      // 3. New user registration via Google
+      const newUserRes = await client.query<UserRow>(
+        `INSERT INTO users (name, email, google_id, email_verified, email_verified_at)
+         VALUES ($1, $2, $3, true, now())
+         RETURNING id, name, email, email_verified, google_id`,
+        [profile.name, profile.email, profile.googleId]
+      );
+      const newUser = newUserRes.rows[0];
+      const wsName = `${profile.name}'s Workspace`.slice(0, 120);
+      const wsResult = await client.query<{ id: string }>(
+        "INSERT INTO workspaces (name) VALUES ($1) RETURNING id",
+        [wsName]
+      );
+      await client.query(
+        "INSERT INTO tenant_memberships (workspace_id, user_id, role) VALUES ($1, $2, 'owner')",
+        [wsResult.rows[0].id, newUser.id]
+      );
+      await client.query("COMMIT");
+      return newUser;
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
+  app.get("/auth/google/url", (req, res) => {
+    if (!isGoogleOAuthConfigured()) {
+      res.json({
+        configured: false,
+        message: "Google OAuth credentials (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET) are not configured."
+      });
+      return;
+    }
+
+    const pkce = generatePkce();
+    const state = randomBytes(32).toString("hex");
+    req.session.googleOAuth = {
+      state,
+      verifier: pkce.verifier,
+      createdAt: Date.now()
+    };
+
+    const redirectUri = `${process.env.WEB_ORIGIN || "http://localhost:3000"}/auth/callback/google`;
+    const url = getGoogleAuthorizationUrl({
+      redirectUri,
+      state,
+      codeChallenge: pkce.challenge
+    });
+
+    res.json({ configured: true, url });
+  });
+
+  app.post("/auth/google/callback", authLimiter, csrfProtection, asyncRoute(async (req, res) => {
+    const { code, state } = req.body ?? {};
+    if (typeof code !== "string" || typeof state !== "string") {
+      res.status(400).json({ error: "Invalid OAuth callback parameters." });
+      return;
+    }
+
+    const savedOAuth = req.session.googleOAuth;
+    if (!savedOAuth || !tokenMatches(savedOAuth.state, state)) {
+      res.status(400).json({ error: "Invalid or expired OAuth state parameter." });
+      return;
+    }
+
+    const redirectUri = `${process.env.WEB_ORIGIN || "http://localhost:3000"}/auth/callback/google`;
+    const tokens = await exchangeGoogleAuthorizationCode({
+      code,
+      redirectUri,
+      codeVerifier: savedOAuth.verifier
+    });
+
+    const googleProfile = await verifyGoogleIdToken(tokens.idToken);
+    if (!googleProfile.emailVerified) {
+      res.status(400).json({ error: "Google account email is not verified." });
+      return;
+    }
+
+    const user = await handleGoogleLogin(googleProfile);
+    await regenerateSession(req);
+    req.session.userId = user.id;
+    req.session.csrfToken = randomBytes(32).toString("hex");
+    await saveSession(req);
+
+    res.json({
+      user: { id: user.id, name: user.name, email: user.email, email_verified: true },
+      csrfToken: req.session.csrfToken
+    });
+  }));
+
+  app.post("/auth/google/token", authLimiter, csrfProtection, asyncRoute(async (req, res) => {
+    const { credential } = req.body ?? {};
+    if (typeof credential !== "string" || !credential.trim()) {
+      res.status(400).json({ error: "Google credential token is required." });
+      return;
+    }
+
+    const googleProfile = await verifyGoogleIdToken(credential);
+    if (!googleProfile.emailVerified) {
+      res.status(400).json({ error: "Google account email is not verified." });
+      return;
+    }
+
+    const user = await handleGoogleLogin(googleProfile);
+    await regenerateSession(req);
+    req.session.userId = user.id;
+    req.session.csrfToken = randomBytes(32).toString("hex");
+    await saveSession(req);
+
+    res.json({
+      user: { id: user.id, name: user.name, email: user.email, email_verified: true },
+      csrfToken: req.session.csrfToken
+    });
   }));
 
   app.post("/auth/logout", csrfProtection, asyncRoute(async (req, res) => {
@@ -314,7 +832,7 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
 
   app.get("/auth/me", requireAuth, (_req, res) => res.json({ user: res.locals.user }));
 
-  app.get("/workspaces", requireAuth, asyncRoute(async (_req, res) => {
+  app.get("/workspaces", requireAuth, requireVerified, asyncRoute(async (_req, res) => {
     const user = res.locals.user as UserRow;
     const result = await pool.query<WorkspaceRow>(
       `SELECT w.id, w.name, w.created_at, m.role
@@ -324,7 +842,7 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     res.json({ workspaces: result.rows });
   }));
 
-  app.post("/workspaces", csrfProtection, requireAuth, asyncRoute(async (req, res) => {
+  app.post("/workspaces", csrfProtection, requireAuth, requireVerified, asyncRoute(async (req, res) => {
     const { name } = req.body ?? {};
     if (typeof name !== "string" || name.trim().length < 1 || name.trim().length > 120) {
       res.status(400).json({ error: "Workspace name must be between 1 and 120 characters." });
@@ -764,6 +1282,17 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
         await client.query("COMMIT");
         res.setHeader("Idempotent-Replayed", "true"); res.status(200).json(existing.rows[0].response_body); return;
       }
+      const usageCheck = await reserveComplaintUsage(client, credential.workspace_id);
+      if (!usageCheck.allowed) {
+        await client.query("ROLLBACK");
+        res.status(usageCheck.statusCode).json({
+          error: usageCheck.error,
+          code: usageCheck.code,
+          upgradeUrl: usageCheck.upgradeUrl,
+          ...(usageCheck.usage ? { usage: usageCheck.usage } : {})
+        });
+        return;
+      }
       const complaintResult = await client.query<ComplaintRow>(
         `INSERT INTO complaints (workspace_id, title, description, customer_email, source, created_by)
          VALUES ($1, $2, $3, $4, 'manual', $5)
@@ -806,6 +1335,17 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
+      const usageCheck = await reserveComplaintUsage(client, String(req.params.workspaceId));
+      if (!usageCheck.allowed) {
+        await client.query("ROLLBACK");
+        res.status(usageCheck.statusCode).json({
+          error: usageCheck.error,
+          code: usageCheck.code,
+          upgradeUrl: usageCheck.upgradeUrl,
+          ...(usageCheck.usage ? { usage: usageCheck.usage } : {})
+        });
+        return;
+      }
       const result = await client.query<ComplaintRow>(
         `INSERT INTO complaints (workspace_id, title, description, customer_email, source, created_by)
          VALUES ($1, $2, $3, $4, 'manual', $5)
@@ -1162,6 +1702,14 @@ export function createApp(options: { metaGraphFetch?: typeof fetch; whatsappGrap
       client.release();
     }
   }));
+
+  mountBillingRoutes(app, {
+    pool,
+    gateway: razorpayGateway,
+    requireAuth,
+    csrfProtection,
+    requireWorkspaceRole
+  });
 
   app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
     console.error("Request failed", error);

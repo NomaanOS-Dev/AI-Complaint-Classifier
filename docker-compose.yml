@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-nomaanos}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-local-password}
     ports:
-      - "${POSTGRES_PORT:-5435}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5436}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -26,9 +26,12 @@ services:
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env before starting NomaanOS}
       NODE_ENV: ${NODE_ENV:-development}
       INTEGRATION_ENCRYPTION_KEY: ${INTEGRATION_ENCRYPTION_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
       RESEND_WEBHOOK_SECRET: ${RESEND_WEBHOOK_SECRET:-}
       RESEND_INBOUND_DOMAIN: ${RESEND_INBOUND_DOMAIN:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
       PUBLIC_FORM_BASE_URL: ${PUBLIC_FORM_BASE_URL:-http://localhost:3000/contact}
       PUBLIC_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
       META_APP_SECRET: ${META_APP_SECRET:-}
@@ -40,7 +43,14 @@ services:
       PORT: 4000
       WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
       AI_SERVICE_URL: http://ai:8000
+      AI_SERVICE_SECRET: ${AI_SERVICE_SECRET:-}
       AI_SERVICE_TIMEOUT_MS: ${AI_SERVICE_TIMEOUT_MS:-30000}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      RAZORPAY_PLAN_STARTER_ID: ${RAZORPAY_PLAN_STARTER_ID:-}
+      RAZORPAY_PLAN_GROWTH_ID: ${RAZORPAY_PLAN_GROWTH_ID:-}
+      RAZORPAY_PLAN_BUSINESS_ID: ${RAZORPAY_PLAN_BUSINESS_ID:-}
     ports:
       - "${API_PORT:-4000}:4000"
     depends_on:
@@ -61,7 +71,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      AI_PROVIDER: ${AI_PROVIDER:-openai}
+      AI_PROVIDER: ${AI_PROVIDER:-gemini}
+      AI_SERVICE_SECRET: ${AI_SERVICE_SECRET:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-6.1-sol}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
@@ -70,7 +81,7 @@ services:
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.8:27b}
       OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-300}
     ports:
-      - "${AI_PORT:-8001}:8000"
+      - "127.0.0.1:${AI_PORT:-8001}:8000"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
       interval: 10s
@@ -87,6 +98,8 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
       API_INTERNAL_URL: http://api:4000
       NEXT_PUBLIC_AI_URL: ${NEXT_PUBLIC_AI_URL:-http://localhost:8001}
+      NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      NEXT_PUBLIC_RAZORPAY_KEY_ID: ${NEXT_PUBLIC_RAZORPAY_KEY_ID:-${RAZORPAY_KEY_ID:-}}
     ports:
       - "${WEB_PORT:-3000}:3000"
     depends_on:

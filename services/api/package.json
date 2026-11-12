@@ -7,6 +7,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/src/server.js",
+    "migrate": "node -e \"import('./dist/src/db.js').then(async (m) => { await m.migrate(); await m.pool.end(); })\"",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts"
   },

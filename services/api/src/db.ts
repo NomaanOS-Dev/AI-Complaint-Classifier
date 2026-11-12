@@ -2,11 +2,17 @@ import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import pg from "pg";
 
-const { Pool } = pg;
+const { Client, Pool } = pg;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+pool.on("error", (error) => {
+  console.error("Unexpected PostgreSQL pool error on idle client:", error);
+});
 
 export async function migrate() {
-  const client = await pool.connect();
+  const client = new Client({
+    connectionString: process.env.DATABASE_URL_UNPOOLED ?? process.env.DATABASE_URL,
+  });
+  await client.connect();
   try {
     await client.query("SELECT pg_advisory_lock(hashtext('schema_migrations'))");
     try {
@@ -40,7 +46,7 @@ export async function migrate() {
       await client.query("SELECT pg_advisory_unlock(hashtext('schema_migrations'))");
     }
   } finally {
-    client.release();
+    await client.end();
   }
 }
 

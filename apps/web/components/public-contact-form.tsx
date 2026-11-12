@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { BrandLockup } from "./brand-logo";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 const apiBase = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
@@ -59,7 +60,7 @@ export function PublicContactForm({ token }: { token: string }) {
 
   return <main className="public-contact-shell">
     <section className="public-contact-card" aria-labelledby="contact-heading">
-      <Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link>
+      <BrandLockup href="/" />
       <p className="eyebrow">CUSTOMER SUPPORT</p><h1 id="contact-heading">{config?.displayName || "Tell us what happened"}</h1>
       <p className="dashboard-intro">Send a message to the support team. Please avoid including passwords or payment card details.</p>
       {active === null ? <p role="status">Checking this form…</p> : !active ? <p className="analytics-error" role="alert">{error || "This contact form is unavailable."}</p> : reference ? <div className="contact-success" role="status"><h2>Your message was received</h2><p>Reference: <code>{reference}</code></p><button className="filter-button" onClick={() => { setReference(""); setError(""); }}>Send another message</button></div> : <form className="public-contact-form" onSubmit={(event) => void submit(event)}>

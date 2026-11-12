@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import { apiErrorMessage, apiRequest } from "../lib/api";
 import { embedSnippetFor, sourceFor, type Technology } from "../lib/integration-snippets";
+import { TwoLayerNavbar } from "./brand-logo";
 
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
 type Credential = { id: string; name: string; key_prefix: string; expires_at: string | null; revoked_at: string | null };
@@ -127,7 +128,11 @@ export function EmbedIntegrateWizard() {
     catch { setError("Clipboard access failed. Select and copy the code manually."); }
   }
 
-  return <main className="dashboard-shell integrations-shell"><nav className="topbar"><Link className="brand" href="/"><span className="brand-mark">N</span><span>nomaan<span className="brand-light">OS</span></span></Link><div className="complaint-nav"><Link className="text-button" href={`/integrations${workspaceId ? `?workspaceId=${workspaceId}` : ""}`}>← Integrations</Link><Link className="text-button" href="/dashboard">Dashboard</Link></div></nav>
+  return <main className="dashboard-shell integrations-shell">
+    <TwoLayerNavbar>
+      <Link className="text-button" href={`/integrations${workspaceId ? `?workspaceId=${workspaceId}` : ""}`}>← Integrations</Link>
+      <Link className="text-button" href="/dashboard">Dashboard</Link>
+    </TwoLayerNavbar>
     <section className="dashboard-content embed-wizard">
       <p className="eyebrow">INTEGRATIONS · SETUP WIZARD</p><h1>Embed &amp; Integrate Form</h1><p className="dashboard-intro">Choose a hosted NomaanOS form for your website or connect your existing form through your own server.</p>
       {workspaceId && <label className="embed-workspace">Workspace<select value={workspaceId} onChange={(event) => { setWorkspaceId(event.target.value); setFormUrl(""); setActiveFormId(""); setEditingFormId(""); setOneTimeSecret(""); setConnectStep(1); void refresh(event.target.value); }}>{workspaces.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.role}</option>)}</select></label>}

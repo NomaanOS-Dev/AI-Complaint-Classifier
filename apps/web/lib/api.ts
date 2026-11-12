@@ -5,7 +5,7 @@ type ApiResponse<T> = { data: T; response: Response };
 
 async function loadCsrfToken() {
   const response = await fetch(`${apiBase}/auth/csrf`, { credentials: "include" });
-  const payload = await response.json() as { csrfToken?: string };
+  const payload = (await response.json()) as { csrfToken?: string };
   if (!response.ok || !payload.csrfToken) throw new Error("Could not start a secure session. Please try again.");
   csrfToken = payload.csrfToken;
   return csrfToken;
@@ -16,12 +16,25 @@ export async function apiRequest<T>(pathname: string, options: RequestInit = {})
   const headers = new Headers(options.headers);
   if (options.body !== undefined) headers.set("content-type", "application/json");
   if (["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
-    headers.set("x-csrf-token", csrfToken ?? await loadCsrfToken());
+    headers.set("x-csrf-token", csrfToken ?? (await loadCsrfToken()));
   }
   const response = await fetch(`${apiBase}${pathname}`, { ...options, method, headers, credentials: "include" });
-  const data = response.status === 204 ? {} as T : await response.json() as T;
+  const data = response.status === 204 ? ({} as T) : ((await response.json()) as T);
   const token = (data as { csrfToken?: string }).csrfToken;
   if (token) csrfToken = token;
+
+  if (response.status === 403 && typeof window !== "undefined") {
+    const errorPayload = data as { code?: string };
+    if (
+      errorPayload?.code === "EMAIL_NOT_VERIFIED" &&
+      !window.location.pathname.startsWith("/verify-email") &&
+      !window.location.pathname.startsWith("/login") &&
+      !window.location.pathname.startsWith("/register")
+    ) {
+      window.location.href = "/verify-email";
+    }
+  }
+
   return { data, response };
 }
 

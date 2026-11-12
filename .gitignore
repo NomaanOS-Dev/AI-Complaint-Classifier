@@ -9,3 +9,7 @@ __pycache__/
 !.env.example
 *.py[cod]
 npm-debug.log*
+.open-next/
+.wrangler/
+*.zip
+.neon

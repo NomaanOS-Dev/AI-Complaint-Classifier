@@ -4,6 +4,7 @@ import { decryptWebhookSecret, encryptWebhookSecret } from "./integration-securi
 import { generateOpaqueRoutingToken, hashClientAddress, sha256 } from "./day8-ingestion.js";
 import { pool } from "./db.js";
 import { enqueueComplaintAnalysis } from "./complaint-analysis-worker.js";
+import { reserveComplaintUsage } from "./billing-service.js";
 
 type Middleware = RequestHandler;
 type RouteOptions = {
@@ -359,6 +360,16 @@ export function mountDay8Routes(app: Application, options: RouteOptions) {
           await client.query("ROLLBACK"); res.status(409).json({ error: "This request key was already used for a different submission." }); return;
         }
         await client.query("COMMIT"); res.setHeader("Idempotent-Replayed", "true"); res.status(200).json(prior.rows[0].response_body); return;
+      }
+      const usageCheck = await reserveComplaintUsage(client, form.workspace_id);
+      if (!usageCheck.allowed) {
+        await client.query("ROLLBACK");
+        res.status(usageCheck.statusCode).json({
+          error: usageCheck.error,
+          code: usageCheck.code,
+          upgradeUrl: usageCheck.upgradeUrl
+        });
+        return;
       }
       const complaint = await client.query<{ id: string }>(
         `INSERT INTO complaints(workspace_id, title, description, customer_name, customer_email, submitted_category, source, created_by)

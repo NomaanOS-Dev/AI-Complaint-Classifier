@@ -1,3 +1,4 @@
+import hmac
 import asyncio
 import json
 import logging
@@ -149,9 +150,33 @@ def sanitize_model_name(name: str) -> str:
     return cleaned[:64] or "unknown-model"
 
 
+def get_ai_service_secret() -> str:
+    return os.getenv("AI_SERVICE_SECRET", "").strip()
+
+
 @app.exception_handler(RequestValidationError)
 async def safe_validation_error(_request: Request, _exc: RequestValidationError):
     return JSONResponse(status_code=422, content={"detail": "Invalid analysis request."})
+
+
+@app.middleware("http")
+async def verify_internal_auth(request: Request, call_next):
+    if request.url.path != "/health":
+        expected_secret = get_ai_service_secret()
+        if not expected_secret:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "AI service authentication is not configured."},
+            )
+
+        token = request.headers.get("x-ai-service-token", "")
+        if not token or not hmac.compare_digest(token.encode("utf-8"), expected_secret.encode("utf-8")):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized AI service access."},
+            )
+
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -203,20 +228,21 @@ def is_provider_configured(provider: str) -> bool:
     return False
 
 
-def get_provider_chain() -> list[str]:
-    base_chain = ["openai", "gemini", "ollama"]
-    provider = os.getenv("AI_PROVIDER", "").strip().lower()
-    if provider in {"openai", "gemini", "ollama"}:
-        remaining = [p for p in base_chain if p != provider]
-        return [provider] + remaining
-    return base_chain
-
-
 def selected_provider() -> str:
-    provider = os.getenv("AI_PROVIDER", "openai").strip().lower()
+    raw = os.getenv("AI_PROVIDER")
+    provider = raw.strip().lower() if raw is not None else "gemini"
+    if provider == "":
+        return "gemini"
     if provider not in {"openai", "gemini", "ollama", "fallback", "all"}:
         raise HTTPException(status_code=503, detail="AI_PROVIDER must be configured as 'openai', 'gemini', 'ollama', or 'fallback'.")
     return provider
+
+
+def get_provider_chain() -> list[str]:
+    provider = selected_provider()
+    if provider in {"openai", "gemini", "ollama"}:
+        return [provider]
+    return ["openai", "gemini", "ollama"]
 
 
 async def request_openai_analysis(client: AsyncOpenAI, model_name: str, complaint_json: str) -> str:
@@ -236,7 +262,11 @@ async def request_openai_analysis(client: AsyncOpenAI, model_name: str, complain
             max_output_tokens=800,
             store=False,
         )
+        if not result.output_text or not result.output_text.strip():
+            raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.")
         return result.output_text
+    except HTTPException:
+        raise
     except APITimeoutError as exc:
         raise HTTPException(status_code=504, detail="AI analysis timed out. Please retry later.") from exc
     except APIConnectionError as exc:
@@ -264,7 +294,11 @@ async def request_gemini_analysis(client: genai.Client, model_name: str, complai
                             max_output_tokens=800,
                         ),
                     )
+                    if not result.text or not result.text.strip():
+                        raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.")
                     return result.text
+                except HTTPException:
+                    raise
                 except genai_errors.APIError as exc:
                     if exc.code not in (429, 500, 502, 503, 504):
                         raise HTTPException(status_code=502, detail="AI provider returned an invalid analysis response.") from exc

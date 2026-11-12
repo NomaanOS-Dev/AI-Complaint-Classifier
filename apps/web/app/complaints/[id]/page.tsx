@@ -73,9 +73,10 @@ export default function ComplaintDetailPage() {
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      const me = await apiRequest<{ user: { id: string } }>("/auth/me");
+      const me = await apiRequest<{ user: { id: string; email_verified?: boolean } }>("/auth/me");
       if (me.response.status === 401) { router.replace("/login"); return; }
       if (!me.response.ok) throw new Error("Could not load your account.");
+      if (me.data.user && me.data.user.email_verified === false) { router.replace("/verify-email"); return; }
       const listed = await apiRequest<{ workspaces: Workspace[] }>("/workspaces");
       if (!listed.response.ok) throw new Error(apiErrorMessage(listed.data, "Could not load workspaces."));
       const requestedId = new URLSearchParams(window.location.search).get("workspaceId");
